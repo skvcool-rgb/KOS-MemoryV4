@@ -101,6 +101,14 @@ class Survey:
     test_status: str = "unknown"                             # "pass" | "fail" | "unknown"
     test_artifact_paths: list[str] = field(default_factory=list)
 
+    # v6.0 — live test_runner dispatch. test_collect_* always populated
+    # when a framework is detected; test_run_* only when opt-in.
+    test_framework: str | None = None
+    test_collect_count: int = 0
+    test_collect_errors: list[str] = field(default_factory=list)
+    test_run_status: str = "skipped"          # skipped | pass | fail | error
+    test_run_elapsed_ms: int = 0
+
     # Errors (don't crash on these — survey is best-effort)
     errors: list[str] = field(default_factory=list)
 
@@ -306,6 +314,38 @@ def _survey_versions(survey: Survey) -> None:
             continue
 
 
+def _survey_test_runner(survey: Survey) -> None:
+    """v6.0: detect framework, run collect-only (always), full suite (opt-in)."""
+    try:
+        from .test_runner import (
+            detect_framework,
+            is_run_tests_enabled,
+            run_collect_only,
+            run_full_suite,
+        )
+    except Exception:
+        return
+
+    fw = detect_framework(survey.project_root)
+    if fw is None:
+        return
+    survey.test_framework = fw.name
+    collect = run_collect_only(survey.project_root, fw, timeout_s=10)
+    survey.test_collect_count = collect.test_count
+    survey.test_collect_errors = collect.parse_errors[:5]
+    if is_run_tests_enabled(survey.project_root):
+        run = run_full_suite(survey.project_root, fw, timeout_s=120)
+        survey.test_run_elapsed_ms = run.elapsed_ms
+        if run.errors:
+            survey.test_run_status = "error"
+        elif run.failed:
+            survey.test_run_status = "fail"
+        elif run.exit_code == 0:
+            survey.test_run_status = "pass"
+        else:
+            survey.test_run_status = "error"
+
+
 def _survey_test_status(survey: Survey) -> None:
     root = Path(survey.project_root)
     artifacts: list[str] = []
@@ -404,6 +444,10 @@ def survey_project(project_root: str | None = None,
         _survey_test_status(survey)
     except Exception as e:
         survey.errors.append(f"test: {e}")
+    try:
+        _survey_test_runner(survey)
+    except Exception as e:
+        survey.errors.append(f"test_runner: {e}")
 
     _write_cache(survey)
     return survey
@@ -456,6 +500,15 @@ def render_live_state(survey: Survey, max_chars: int = 2500) -> str:
     if survey.test_status != "unknown":
         lines.append(f"  test status:   last run = {survey.test_status} "
                      f"(via {len(survey.test_artifact_paths)} cached artifacts)")
+    if survey.test_framework:
+        line = (f"  test runner:   {survey.test_framework}, "
+                f"collect={survey.test_collect_count}")
+        if survey.test_collect_errors:
+            line += f", parse_errors={len(survey.test_collect_errors)}"
+        if survey.test_run_status != "skipped":
+            line += (f", run={survey.test_run_status} "
+                     f"({survey.test_run_elapsed_ms}ms)")
+        lines.append(line)
 
     out = "\n".join(lines)
     if len(out) > max_chars:

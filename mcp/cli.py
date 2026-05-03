@@ -6,15 +6,23 @@ markdown slash commands shell out to. Returns JSON on stdout.
 Usage:
     python -m mcp.cli <subcommand> [args...]
 
-Subcommands:
-    recall_stage_a   — Stage 0 (local expansion) + Stage 1 (catalog)
-    recall_stage_b   — Stage 2 (grep over selected sessions)
-    remember         — Pin user-asserted fact
-    status           — Store stats
-    export           — Dump store to JSON
-    import_export    — Load JSON into store
-    rebuild_catalog  — Force catalog refresh
+Subcommands (v5.0):
+    recall_stage_a    — Stage 0 (local expansion) + Stage 1 (catalog)
+    recall_stage_b    — Stage 2 (grep over selected sessions)
+    remember          — Pin user-asserted fact
+    status            — Store stats
+    export            — Dump store to JSON
+    import_export     — Load JSON into store
+    rebuild_catalog   — Force catalog refresh
+    memory_mode       — Toggle primary/backup mode
     mark_contradicted — Flag chunks as superseded
+
+Subcommands (v6.0):
+    bootstrap         — Seed store from project docs + Claude Code transcripts
+    curate            — Append/refresh marker-fenced suggestions in MEMORY.md
+    sync              — Sidecar-git multi-machine sync (push|pull|init|status)
+    test_status       — Detect framework, run collect-only (+ full run if opt-in)
+    serve             — Start local HTTP API for non-CC tools (delegates to mcp.http_server)
 """
 from __future__ import annotations
 
@@ -458,6 +466,166 @@ def cmd_memory_mode(args) -> int:
     return 0
 
 
+def cmd_bootstrap(args) -> int:
+    """v6.0: one-shot seed of chunks.db from project docs + CC transcripts."""
+    from lib.bootstrap import DEFAULT_MAX_TRANSCRIPTS, bootstrap_project
+    kos_dir = _resolve_kos_dir(args)
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    report = bootstrap_project(project, max_transcripts=int(args.max_transcripts))
+    _emit({
+        "ok": (not report.errors) or (report.chunks_added > 0),
+        "kos_dir": str(kos_dir),
+        **report.as_dict(),
+    })
+    return 0
+
+
+def cmd_curate(args) -> int:
+    """v6.0: refresh marker-fenced auto-suggestions block in MEMORY.md."""
+    from lib.auto_suggestions import (
+        append_to_memory_md,
+        extract_high_value_chunks,
+        format_suggestions_block,
+    )
+    from lib.memory_md import find_memory_files
+    kos_dir = _resolve_kos_dir(args)
+    db = kos_dir / FILE_CHUNKS_DB
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+    suggestions: list = []
+    if db.exists():
+        store = Store(db)
+        try:
+            suggestions = extract_high_value_chunks(
+                store.iter_chunks(), max_n=20,
+            )
+        finally:
+            store.close()
+
+    block = format_suggestions_block(suggestions, project_name=project)
+
+    if args.target:
+        target = Path(args.target)
+    else:
+        files = find_memory_files(project)
+        target = files[0].path if files else Path(project) / "MEMORY.md"
+
+    if args.write:
+        report = append_to_memory_md(
+            target, block, suggestion_count=len(suggestions),
+        )
+        _emit({
+            "ok": not report.errors,
+            "mode": "write",
+            "target": str(target),
+            "suggestion_count": len(suggestions),
+            "block": block,
+            "report": {
+                "path": report.path, "was_appended": report.was_appended,
+                "was_replaced": report.was_replaced,
+                "bytes_written": report.bytes_written,
+                "suggestion_count": report.suggestion_count,
+                "errors": report.errors,
+            },
+        })
+        return 0 if not report.errors else 1
+
+    _emit({
+        "ok": True, "mode": "preview", "target": str(target),
+        "suggestion_count": len(suggestions), "block": block, "report": None,
+    })
+    return 0
+
+
+def cmd_sync(args) -> int:
+    """v6.0: sidecar-git multi-machine sync."""
+    from lib.sync import (
+        SYNC_BRANCH,
+        _sync_dir_for,
+        prepare_sync_repo,
+        sync_pull,
+        sync_push,
+    )
+    kos_dir = _resolve_kos_dir(args)
+    sub = args.sync_cmd
+    if sub == "init":
+        repo = prepare_sync_repo(kos_dir, remote_url=args.remote)
+        _emit({
+            "ok": True, "sync_dir": str(repo.sync_dir),
+            "branch": repo.branch, "remote": repo.remote_url,
+            "initialized": repo.initialized,
+        })
+        return 0
+    if sub == "push":
+        r = sync_push(kos_dir, message=args.message)
+        _emit({
+            "ok": r.ok, "committed": r.committed, "pushed": r.pushed,
+            "commit_sha": r.commit_sha, "error": r.error,
+            "snapshot": (
+                {"chunks": r.snapshot.chunks,
+                 "sessions": r.snapshot.sessions,
+                 "bytes": r.snapshot.bytes}
+                if r.snapshot else None
+            ),
+        })
+        return 0 if r.ok else 1
+    if sub == "pull":
+        r = sync_pull(kos_dir)
+        merge = r.merge
+        _emit({
+            "ok": r.ok, "pulled": r.pulled, "error": r.error,
+            "merge": (
+                {"chunks_imported": merge.chunks_imported,
+                 "chunks_skipped": merge.chunks_skipped,
+                 "sessions_upserted": merge.sessions_upserted}
+                if merge else None
+            ),
+        })
+        return 0 if r.ok else 1
+    if sub == "status":
+        sd = _sync_dir_for(kos_dir)
+        _emit({
+            "ok": True, "sync_dir": str(sd),
+            "exists": (sd / ".git").exists(), "branch": SYNC_BRANCH,
+        })
+        return 0
+    return _err(f"unknown sync subcommand: {sub}")
+
+
+def cmd_test_status(args) -> int:
+    """v6.0: detect framework, run collect-only, optionally run full suite."""
+    from dataclasses import asdict
+    from lib.test_runner import (
+        detect_framework,
+        is_run_tests_enabled,
+        run_collect_only,
+        run_full_suite,
+    )
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    fw = detect_framework(project)
+    payload: dict = {
+        "ok": True,
+        "framework": fw.name if fw else None,
+        "framework_command": fw.command if fw else None,
+    }
+    collect = run_collect_only(project, fw, timeout_s=args.collect_timeout_s)
+    payload["collect"] = asdict(collect)
+    if args.run or is_run_tests_enabled(project):
+        run = run_full_suite(project, fw, timeout_s=args.run_timeout_s)
+        payload["run"] = asdict(run)
+    _emit(payload)
+    return 0
+
+
+def cmd_serve(args) -> int:
+    """v6.0: start local HTTP API (delegates to mcp.http_server)."""
+    from mcp import http_server as _hs
+    argv = ["--port", str(args.port)]
+    if args.token:
+        argv += ["--token", args.token]
+    return _hs.main(argv)
+
+
 def cmd_mark_contradicted(args) -> int:
     """Flag chunks as superseded by later session."""
     kos_dir = _resolve_kos_dir(args)
@@ -537,6 +705,49 @@ def main(argv: list[str] | None = None) -> int:
     pm.add_argument("--user", action="store_true")
     pm.add_argument("--ids", required=True)
     pm.set_defaults(func=cmd_mark_contradicted)
+
+    # ── v6.0 subcommands ─────────────────────────────────────
+    pbs = sub.add_parser("bootstrap",
+                         help="Seed store from project docs + CC transcripts")
+    pbs.add_argument("--max-transcripts", type=int, default=10)
+    pbs.add_argument("--user", action="store_true")  # accepted; project-scoped
+    pbs.set_defaults(func=cmd_bootstrap)
+
+    pcu = sub.add_parser(
+        "curate",
+        help="Append/refresh marker-fenced suggestions in MEMORY.md",
+    )
+    pcu.add_argument("--preview", action="store_true")
+    pcu.add_argument("--write", action="store_true")
+    pcu.add_argument("--target", default=None)
+    pcu.add_argument("--user", action="store_true")
+    pcu.set_defaults(func=cmd_curate)
+
+    psy = sub.add_parser("sync",
+                         help="Sidecar-git multi-machine sync")
+    psy.add_argument("sync_cmd", choices=("init", "push", "pull", "status"))
+    psy.add_argument("--remote", default=None)
+    psy.add_argument("--message", default=None)
+    psy.add_argument("--user", action="store_true")
+    psy.set_defaults(func=cmd_sync)
+
+    pts = sub.add_parser(
+        "test_status",
+        help="Detect framework + collect-only (+ run if opt-in)",
+    )
+    pts.add_argument("--run", action="store_true",
+                     help="Force full-suite run (overrides config gate)")
+    pts.add_argument("--collect-timeout-s", type=int, default=10)
+    pts.add_argument("--run-timeout-s", type=int, default=120)
+    pts.set_defaults(func=cmd_test_status)
+
+    psv = sub.add_parser(
+        "serve",
+        help="Start local HTTP API (delegates to mcp.http_server)",
+    )
+    psv.add_argument("--port", type=int, default=7621)
+    psv.add_argument("--token", default=None)
+    psv.set_defaults(func=cmd_serve)
 
     args = p.parse_args(argv)
     return args.func(args)

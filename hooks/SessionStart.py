@@ -164,6 +164,23 @@ def main() -> int:
                 f"[kos-memory PRIMARY] No chunks yet for this project, but "
                 f"{len(memory_files)} MEMORY.md anchor(s) found:\n\n{block}"
             )
+        # v6.0: empty-store nudge — if no chunks AND no MEMORY.md, look
+        # for bootstrap sources (README/CHANGELOG/CC transcripts) so the
+        # operator can /memory-bootstrap to seed in one shot.
+        if get_mode(project) == MODE_PRIMARY and not memory_files:
+            try:
+                from lib.bootstrap import find_bootstrap_sources
+                srcs = find_bootstrap_sources(project)
+            except Exception:
+                srcs = []
+            if srcs:
+                n_doc = sum(1 for s in srcs if s.kind == "doc")
+                n_ts = sum(1 for s in srcs if s.kind == "transcript")
+                print(
+                    f"[kos-memory PRIMARY] Empty store. Found {n_doc} docs + "
+                    f"{n_ts} prior transcripts on disk — run "
+                    f"/memory-bootstrap to seed memory in one shot."
+                )
         sys.exit(0)
 
     try:

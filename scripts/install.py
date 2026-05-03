@@ -104,7 +104,7 @@ def merge_plugin_into_settings(
     enabled = settings.setdefault("enabledPlugins", {})
     enabled["kos-memory"] = {
         "path": plugin_root_str,
-        "version": "5.0.0",
+        "version": "6.0.0",
     }
 
     # Block 2: mcpServers (so MCP server is registered globally too).
@@ -317,6 +317,20 @@ def main() -> int:
     print("=" * 60)
     print("Done. Restart Claude Code, then try:  /memory-status")
     print("=" * 60)
+
+    # v6.0: cross-tool nudge — kos-memory storage is reachable from non-CC
+    # tools too. Don't auto-modify other tools' configs (intrusive); just
+    # point the operator at the integration docs.
+    if not args.dry_run:
+        print()
+        print("[cross-tool] kos-memory storage is now reachable from non-CC tools:")
+        print("  Claude Desktop / Cursor / Cline / Zed   "
+              "→ mcp.standalone_server (see docs/integrations/)")
+        print("  Aider / Continue.dev / shell scripts    "
+              "→ python -m mcp.http_server  (see docs/integrations/)")
+        print("  Any local CLI                           "
+              "→ python -m mcp.standalone_cli status")
+
     # Friendly nag for contributors: don't accidentally commit the per-user
     # python path baked into plugin.json
     if not args.dry_run and (PLUGIN_ROOT / ".git").exists():

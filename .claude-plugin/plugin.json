@@ -1,0 +1,28 @@
+{
+  "name": "kos-memory",
+  "version": "4.0.0",
+  "description": "Per-project, hybrid-retrieval memory backup layer for Claude Code. Pure-stdlib, zero dependencies. Backup mode — never primary.",
+  "author": "skvcool-rgb",
+  "license": "MIT",
+  "homepage": "https://github.com/skvcool-rgb/KOS-Memory",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "python ${CLAUDE_PLUGIN_ROOT}/hooks/SessionStart.py", "timeout": 3}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "python ${CLAUDE_PLUGIN_ROOT}/hooks/Stop.py", "timeout": 15}]}
+    ],
+    "PreCompact": [
+      {"matcher": "auto", "hooks": [{"type": "command", "command": "python ${CLAUDE_PLUGIN_ROOT}/hooks/PreCompact.py", "timeout": 8}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "python ${CLAUDE_PLUGIN_ROOT}/hooks/UserPromptSubmit.py", "timeout": 2}]}
+    ]
+  },
+  "mcpServers": {
+    "kos-memory": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.py"]
+    }
+  }
+}

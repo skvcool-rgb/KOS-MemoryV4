@@ -1,0 +1,253 @@
+#!/usr/bin/env python
+"""kos-memory v4 installer.
+
+Registers the plugin with Claude Code by:
+1. Verifying Python 3.9+ is available.
+2. Adding the plugin directory to ~/.claude/settings.json under
+   `enabledPlugins` (or equivalent), and the MCP server under `mcpServers`.
+3. Smoke-testing the install with a temp .kos-memory store.
+
+Pure stdlib. Safe to re-run (idempotent).
+
+Usage:
+    python scripts/install.py [--dry-run] [--user-settings PATH]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+SETTINGS_DEFAULT = Path.home() / ".claude" / "settings.json"
+
+# Force UTF-8 stdout — installer prints non-ASCII characters
+sys.path.insert(0, str(PLUGIN_ROOT))
+try:
+    from lib.stdio_utf8 import force_utf8_io
+    force_utf8_io()
+except Exception:
+    pass
+
+
+def check_python() -> tuple[bool, str]:
+    v = sys.version_info
+    if (v.major, v.minor) < (3, 9):
+        return False, f"Python 3.9+ required, got {v.major}.{v.minor}.{v.micro}"
+    return True, f"Python {v.major}.{v.minor}.{v.micro} OK"
+
+
+def check_files() -> tuple[bool, list[str]]:
+    """Verify all expected plugin files exist."""
+    required = [
+        ".claude-plugin/plugin.json",
+        "lib/__init__.py",
+        "lib/store.py",
+        "lib/chunker.py",
+        "lib/search.py",
+        "lib/budget.py",
+        "lib/catalog.py",
+        "lib/recall.py",
+        "lib/paths.py",
+        "hooks/SessionStart.py",
+        "hooks/Stop.py",
+        "hooks/PreCompact.py",
+        "hooks/UserPromptSubmit.py",
+        "mcp/server.py",
+        "mcp/cli.py",
+        "commands/recall.md",
+        "commands/remember.md",
+        "commands/memory-status.md",
+        "skills/memory-recovery/SKILL.md",
+    ]
+    missing = []
+    for r in required:
+        if not (PLUGIN_ROOT / r).exists():
+            missing.append(r)
+    return (len(missing) == 0), missing
+
+
+def load_settings(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    # utf-8-sig transparently strips a BOM if present (common on Windows)
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            text = path.read_text(encoding=encoding)
+            return json.loads(text)
+        except UnicodeDecodeError:
+            continue
+        except json.JSONDecodeError as e:
+            print(f"  WARN: existing settings.json is not valid JSON: {e}",
+                  file=sys.stderr)
+            return {}
+        except Exception as e:
+            print(f"  WARN: existing settings.json unreadable: {e}",
+                  file=sys.stderr)
+            return {}
+    print("  WARN: settings.json had encoding we couldn't decode", file=sys.stderr)
+    return {}
+
+
+def merge_plugin_into_settings(settings: dict, plugin_root: Path) -> dict:
+    """Add kos-memory plugin block + MCP server. Idempotent."""
+    plugin_root_str = str(plugin_root.resolve()).replace("\\", "/")
+
+    # Block 1: enabledPlugins (Claude Code plugin auto-load convention)
+    enabled = settings.setdefault("enabledPlugins", {})
+    enabled["kos-memory"] = {
+        "path": plugin_root_str,
+        "version": "4.0.0",
+    }
+
+    # Block 2: mcpServers (so MCP server is registered globally too)
+    mcp = settings.setdefault("mcpServers", {})
+    mcp["kos-memory"] = {
+        "command": "python",
+        "args": [str(plugin_root / "mcp" / "server.py").replace("\\", "/")],
+    }
+
+    return settings
+
+
+def write_settings(path: Path, settings: dict) -> None:
+    """Atomic write of settings.json."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    if path.exists():
+        bak = path.with_suffix(path.suffix + f".bak-{int(time.time())}")
+        shutil.copy2(path, bak)
+        print(f"  backed up existing settings to {bak.name}")
+    tmp.replace(path)
+
+
+def smoke_test() -> tuple[bool, str]:
+    """Create a temp store, insert chunk, recall it. Verifies imports + SQLite + grep."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    try:
+        from lib.chunker import chunk_text
+        from lib.paths import FILE_CHUNKS_DB, ensure_kos_dir
+        from lib.recall import execute_recall_local_only
+        from lib.store import Store
+    except Exception as e:
+        return False, f"import failed: {e}"
+
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            kos = ensure_kos_dir(td, user_level=False)
+        except Exception as e:
+            return False, f"ensure_kos_dir failed: {e}"
+
+        store = Store(kos / FILE_CHUNKS_DB)
+        try:
+            chunks = chunk_text(
+                "The quick brown fox jumps over the lazy dog. "
+                "We refactored the auth module to use OAuth2 with PKCE.",
+                max_chars=400,
+                overlap=50,
+            )
+            for c in chunks:
+                store.add_chunk(
+                    session_id="smoke_session",
+                    project=td,
+                    ts=int(time.time()),
+                    text=c.text,
+                    kind=c.kind,
+                    language=c.language,
+                    file_refs=[],
+                    asserted_by_user=False,
+                )
+            store.upsert_session(
+                "smoke_session",
+                started_at=int(time.time()) - 60,
+                ended_at=int(time.time()),
+                project=td,
+                chunk_count=len(chunks),
+            )
+        finally:
+            store.close()
+
+        rc = execute_recall_local_only(query="auth oauth", window_days=1, project_root=td)
+        if not rc.passages:
+            return False, "recall returned 0 passages on smoke data"
+
+        return True, f"recall returned {len(rc.passages)} passages, OK"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="kos-memory-install")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would change without writing.")
+    parser.add_argument("--user-settings", default=str(SETTINGS_DEFAULT),
+                        help=f"Path to Claude settings.json (default: {SETTINGS_DEFAULT})")
+    parser.add_argument("--skip-smoke", action="store_true",
+                        help="Skip the post-install smoke test.")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("kos-memory v4 installer")
+    print("=" * 60)
+    print(f"Plugin root: {PLUGIN_ROOT}")
+    print(f"Settings:    {args.user_settings}")
+    print(f"Mode:        {'DRY-RUN' if args.dry_run else 'INSTALL'}")
+    print()
+
+    # Step 1: Python version
+    ok, msg = check_python()
+    print(f"[1/5] Python check: {msg}")
+    if not ok:
+        print("  ABORT: incompatible Python.")
+        return 1
+
+    # Step 2: Plugin file integrity
+    ok, missing = check_files()
+    if not ok:
+        print(f"[2/5] File check: MISSING {len(missing)} files:")
+        for m in missing:
+            print(f"      - {m}")
+        return 1
+    print(f"[2/5] File check: all required files present")
+
+    # Step 3: Load settings
+    settings_path = Path(args.user_settings).expanduser()
+    settings = load_settings(settings_path)
+    print(f"[3/5] Loaded settings ({len(settings)} top-level keys)")
+
+    # Step 4: Merge
+    settings = merge_plugin_into_settings(settings, PLUGIN_ROOT)
+    if args.dry_run:
+        print(f"[4/5] DRY-RUN: would write the following blocks to settings:")
+        preview = {
+            "enabledPlugins": settings.get("enabledPlugins", {}),
+            "mcpServers": {"kos-memory": settings.get("mcpServers", {}).get("kos-memory")},
+        }
+        print(json.dumps(preview, indent=2))
+    else:
+        write_settings(settings_path, settings)
+        print(f"[4/5] Wrote settings to {settings_path}")
+
+    # Step 5: Smoke test
+    if args.skip_smoke or args.dry_run:
+        print(f"[5/5] Smoke test: SKIPPED")
+    else:
+        ok, msg = smoke_test()
+        print(f"[5/5] Smoke test: {msg}")
+        if not ok:
+            print("  WARNING: install completed but smoke test failed. Investigate.")
+            return 2
+
+    print()
+    print("=" * 60)
+    print("Done. Restart Claude Code, then try:  /memory-status")
+    print("=" * 60)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

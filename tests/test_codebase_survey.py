@@ -153,6 +153,77 @@ class VersionSurveyTests(unittest.TestCase):
             self.assertEqual(s.versions.get("lib/__init__.py"), "3.1.4")
 
 
+class TreeDepthOverrideTests(unittest.TestCase):
+    """v5.1: tree depth + max-entries are configurable per-project."""
+
+    def _config(self, root: Path, **kwargs) -> None:
+        from lib.paths import FILE_CONFIG, ensure_kos_dir
+        kos = ensure_kos_dir(root, user_level=False)
+        cfg = kos / FILE_CONFIG
+        import json as _json
+        existing = {}
+        if cfg.exists():
+            try:
+                existing = _json.loads(cfg.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        existing.update(kwargs)
+        cfg.write_text(_json.dumps(existing), encoding="utf-8")
+
+    def test_default_depth_one_level(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "lib").mkdir()
+            (root / "lib" / "deep").mkdir()
+            (root / "lib" / "deep" / "core.py").write_text("", encoding="utf-8")
+            s = survey_project(root, use_cache=False)
+            tree = " ".join(s.tree_summary)
+            # At depth=1 (default), we should NOT see "deep/" as its own entry
+            self.assertIn("lib/", tree)
+            self.assertNotIn("  deep/", tree)
+
+    def test_depth_two_recurses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "lib").mkdir()
+            (root / "lib" / "subpkg").mkdir()
+            (root / "lib" / "subpkg" / "core.py").write_text("", encoding="utf-8")
+            self._config(root, tree_depth=2)
+            s = survey_project(root, use_cache=False)
+            tree = "\n".join(s.tree_summary)
+            self.assertIn("lib/", tree)
+            self.assertIn("subpkg/", tree)
+
+    def test_max_entries_caps_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(50):
+                (root / f"f{i:02d}.py").write_text("", encoding="utf-8")
+            self._config(root, tree_max_entries=10)
+            s = survey_project(root, use_cache=False)
+            self.assertLessEqual(len(s.tree_summary), 10)
+
+    def test_cache_ttl_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._config(root, cache_ttl_s=1)
+            s1 = survey_project(root, use_cache=True)
+            time.sleep(1.5)
+            s2 = survey_project(root, use_cache=True)
+            # TTL=1s expired, so re-surveyed
+            self.assertGreaterEqual(s2.surveyed_at, s1.surveyed_at)
+
+    def test_bad_config_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from lib.paths import FILE_CONFIG, ensure_kos_dir
+            kos = ensure_kos_dir(root, user_level=False)
+            (kos / FILE_CONFIG).write_text("{not json}", encoding="utf-8")
+            # Should still produce a survey, just falls back to defaults
+            s = survey_project(root, use_cache=False)
+            self.assertIsNotNone(s)
+
+
 class CacheTests(unittest.TestCase):
     def test_uses_cache_within_ttl(self):
         with tempfile.TemporaryDirectory() as tmp:

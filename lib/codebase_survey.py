@@ -20,13 +20,35 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# Bounds — keeps survey fast and output small
+# Bounds — keeps survey fast and output small. v5.1: overridable per-project
+# via <kos-dir>/config.json keys: tree_depth, tree_max_entries, max_commits,
+# max_tags, git_timeout_s, cache_ttl_s.
 MAX_COMMITS = 20
 MAX_TAGS = 10
 MAX_TREE_ENTRIES = 60
 MAX_TREE_DEPTH = 3
 GIT_TIMEOUT_S = 2.0
 CACHE_TTL_S = 60
+
+
+def _load_overrides(project_root: str) -> dict:
+    """Read survey-related overrides from <kos-dir>/config.json.
+    Empty dict on any failure — overrides are best-effort."""
+    try:
+        from .paths import FILE_CONFIG, ensure_kos_dir
+        kos = ensure_kos_dir(project_root, user_level=False)
+        cfg = kos / FILE_CONFIG
+        if not cfg.exists():
+            return {}
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        out = {}
+        for key in ("tree_depth", "tree_max_entries", "max_commits",
+                    "max_tags", "git_timeout_s", "cache_ttl_s"):
+            if key in data and isinstance(data[key], (int, float)):
+                out[key] = data[key]
+        return out
+    except Exception:
+        return {}
 
 # Files to extract version info from
 VERSION_FILES = (
@@ -102,8 +124,11 @@ def _run_git(args: list[str], cwd: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _survey_git(survey: Survey) -> None:
+def _survey_git(survey: Survey, overrides: dict | None = None) -> None:
     root = survey.project_root
+    o = overrides or {}
+    max_commits = int(o.get("max_commits", MAX_COMMITS))
+    max_tags = int(o.get("max_tags", MAX_TAGS))
 
     ok, _ = _run_git(["rev-parse", "--is-inside-work-tree"], root)
     if not ok:
@@ -132,7 +157,7 @@ def _survey_git(survey: Survey) -> None:
 
     # Last N commits
     ok, log = _run_git([
-        "log", f"-{MAX_COMMITS}",
+        "log", f"-{max_commits}",
         "--format=%h\x1f%ct\x1f%s",
     ], root)
     if ok and log:
@@ -150,7 +175,7 @@ def _survey_git(survey: Survey) -> None:
         "tag", "-l", "--sort=-creatordate",
     ], root)
     if ok and tags:
-        survey.tags = tags.splitlines()[:MAX_TAGS]
+        survey.tags = tags.splitlines()[:max_tags]
 
     # Ahead/behind upstream
     ok, upstream = _run_git([
@@ -171,55 +196,84 @@ def _survey_git(survey: Survey) -> None:
                     pass
 
 
-def _survey_tree(survey: Survey) -> None:
-    """Top-level + 1-level tree summary. Counts files by extension."""
+_SKIP_DIRS = {".git", "__pycache__", ".kos-memory", "node_modules",
+              ".pytest_cache", ".idea", ".vscode", "target",
+              "dist", "build", ".tox", ".mypy_cache", ".ruff_cache",
+              ".venv", "venv", "env", ".env"}
+
+
+def _walk_tree(root: Path, max_depth: int, max_entries: int,
+               survey: Survey, prefix: str = "", depth: int = 0) -> None:
+    """Recursive tree walk to configurable depth. Capped at max_entries
+    total. Top-level (depth=0) entries are full names; deeper entries
+    use indented prefix for clarity."""
+    if depth >= max_depth:
+        return
+    if len(survey.tree_summary) >= max_entries:
+        return
+    try:
+        entries = sorted(root.iterdir(),
+                         key=lambda p: (not p.is_dir(), p.name.lower()))
+    except (PermissionError, OSError):
+        return
+
+    for entry in entries:
+        if len(survey.tree_summary) >= max_entries:
+            return
+        if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+            if entry.name not in (".claude-plugin", ".github"):
+                # Allow those two — they often hold meaningful config
+                continue
+        if entry.is_file():
+            survey.tree_summary.append(f"{prefix}{entry.name}")
+            survey.file_count += 1
+            continue
+        if not entry.is_dir():
+            continue
+
+        # Count files by ext at this level for compact summary
+        ext_counts: dict[str, int] = {}
+        try:
+            for sub in entry.iterdir():
+                if sub.is_file():
+                    ext = sub.suffix or "(no-ext)"
+                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                    survey.file_count += 1
+        except (PermissionError, OSError):
+            continue
+
+        if ext_counts:
+            ext_str = ", ".join(
+                f"{n} {ext}"
+                for ext, n in sorted(ext_counts.items(),
+                                     key=lambda x: -x[1])[:3]
+            )
+            survey.tree_summary.append(f"{prefix}{entry.name}/ ({ext_str})")
+        else:
+            survey.tree_summary.append(f"{prefix}{entry.name}/ (empty)")
+
+        # Recurse if depth budget allows
+        if depth + 1 < max_depth:
+            _walk_tree(entry, max_depth, max_entries, survey,
+                       prefix=prefix + "  ", depth=depth + 1)
+
+
+def _survey_tree(survey: Survey, overrides: dict | None = None) -> None:
+    """Configurable tree walk. Defaults stay at 1-level for performance,
+    operator can crank up via .kos-memory/config.json."""
+    o = overrides or {}
+    # Default tree_depth=1 means "top-level + count files inside one level"
+    # which matches v5.0 behavior. Setting tree_depth=2+ enables deeper walk.
+    max_depth = max(1, int(o.get("tree_depth", 1)))
+    max_entries = max(10, int(o.get("tree_max_entries", MAX_TREE_ENTRIES)))
+
     root = Path(survey.project_root)
     if not root.exists():
         return
-
-    # Top-level dirs and their contents
-    summary: list[str] = []
-    file_count = 0
-    skip_dirs = {".git", "__pycache__", ".kos-memory", "node_modules",
-                 ".pytest_cache", ".idea", ".vscode", "target",
-                 "dist", "build", ".tox", ".mypy_cache", ".ruff_cache"}
-
     try:
-        top_level = sorted(root.iterdir(),
-                           key=lambda p: (not p.is_dir(), p.name.lower()))
-        for entry in top_level[:MAX_TREE_ENTRIES]:
-            if entry.name in skip_dirs:
-                continue
-            if entry.is_file():
-                summary.append(entry.name)
-                file_count += 1
-                continue
-            if not entry.is_dir():
-                continue
-            # Count files by ext one level down
-            ext_counts: dict[str, int] = {}
-            try:
-                for sub in entry.iterdir():
-                    if sub.is_file():
-                        ext = sub.suffix or "(no-ext)"
-                        ext_counts[ext] = ext_counts.get(ext, 0) + 1
-                        file_count += 1
-            except (PermissionError, OSError):
-                continue
-            if ext_counts:
-                ext_str = ", ".join(
-                    f"{n} {ext}"
-                    for ext, n in sorted(ext_counts.items(),
-                                         key=lambda x: -x[1])[:3]
-                )
-                summary.append(f"{entry.name}/ ({ext_str})")
-            else:
-                summary.append(f"{entry.name}/ (empty)")
+        _walk_tree(root, max_depth, max_entries, survey)
     except Exception as e:
         survey.errors.append(f"tree walk failed: {e}")
-
-    survey.tree_summary = summary[:MAX_TREE_ENTRIES]
-    survey.file_count = file_count
 
 
 _VERSION_PATTERNS = (
@@ -285,14 +339,15 @@ def _cache_path(project_root: str) -> Path:
     return kos / "survey_cache.json"
 
 
-def _read_cache(project_root: str) -> Survey | None:
+def _read_cache(project_root: str, overrides: dict | None = None) -> Survey | None:
+    ttl = int((overrides or {}).get("cache_ttl_s", CACHE_TTL_S))
     p = _cache_path(project_root)
     if not p.exists():
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         s = Survey(**data)
-        if s.surveyed_at + CACHE_TTL_S < int(time.time()):
+        if s.surveyed_at + ttl < int(time.time()):
             return None
         if s.project_root != project_root:
             return None
@@ -314,13 +369,17 @@ def _write_cache(survey: Survey) -> None:
 
 def survey_project(project_root: str | None = None,
                    use_cache: bool = True) -> Survey:
-    """Survey the project. Cached for 60s by default."""
+    """Survey the project. Cached per overrides['cache_ttl_s'] (default 60s).
+    All bounds (commits, tags, tree depth/breadth, git timeout) are
+    overridable via <kos-dir>/config.json — see _load_overrides()."""
     if project_root is None:
         project_root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     project_root = str(Path(project_root).resolve())
 
+    overrides = _load_overrides(project_root)
+
     if use_cache:
-        cached = _read_cache(project_root)
+        cached = _read_cache(project_root, overrides)
         if cached is not None:
             return cached
 
@@ -330,11 +389,11 @@ def survey_project(project_root: str | None = None,
     )
 
     try:
-        _survey_git(survey)
+        _survey_git(survey, overrides)
     except Exception as e:
         survey.errors.append(f"git: {e}")
     try:
-        _survey_tree(survey)
+        _survey_tree(survey, overrides)
     except Exception as e:
         survey.errors.append(f"tree: {e}")
     try:

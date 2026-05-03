@@ -2,11 +2,36 @@
 
 **Per-project, hybrid-retrieval memory backup for Claude Code. Pure-stdlib, zero dependencies. Backup mode — never primary.**
 
+[![Tests](https://img.shields.io/badge/tests-164%2F164-brightgreen)](#testing)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
+[![Dependencies](https://img.shields.io/badge/deps-zero-brightgreen)](#requirements)
+
 ```
 [kos-memory BACKUP] 1,247 chunks, 52 sessions for this project
                     (last ingest: today). Use /recall when current
                     context is missing past detail.
 ```
+
+## Install (60 seconds)
+
+**Requirements:** Python 3.9+ and Claude Code. Nothing else.
+
+```bash
+git clone https://github.com/skvcool-rgb/KOS-MemoryV4.git
+cd KOS-MemoryV4
+python scripts/install.py            # use python3 on Mac/Linux if needed
+```
+
+That's it. Restart Claude Code, then in any project type `/memory-status`. The installer:
+
+1. Detects which Python interpreter you used and bakes its absolute path into the plugin manifest (no `python` vs `python3` PATH hassles).
+2. Registers the plugin and MCP server in `~/.claude/settings.json` (atomic write, with backup).
+3. Runs a smoke test: creates a temp `.kos-memory/`, ingests a chunk, recalls it.
+
+Re-run `python scripts/install.py` any time — it's idempotent.
+
+**Uninstall:** delete the `kos-memory` entries from `~/.claude/settings.json`. Per-project data lives in each project's `.kos-memory/` directory (delete to wipe).
 
 ## What it does
 
@@ -24,20 +49,11 @@
 - It does **not** use ML or embeddings. BM25 + grep + a tiny synonym cache.
 - It does **not** auto-recall. You or Claude has to explicitly request it.
 
-## Quick install
+## Testing
 
 ```bash
-# Clone or download this repo, then:
-python scripts/install.py
-
-# Or, if Claude Code's plugin marketplace is configured:
-# (manual instructions in DEPLOYMENT.md)
+python -m unittest discover tests    # 164 tests, ~13 seconds
 ```
-
-The installer:
-1. Registers the plugin in `~/.claude/settings.json` (`mcpServers` and `plugins` blocks).
-2. Verifies Python 3.9+ is available.
-3. Runs a smoke test (creates a temp `.kos-memory/`, inserts a chunk, recalls it).
 
 ## Quick use
 

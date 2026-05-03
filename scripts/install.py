@@ -94,7 +94,9 @@ def load_settings(path: Path) -> dict:
     return {}
 
 
-def merge_plugin_into_settings(settings: dict, plugin_root: Path) -> dict:
+def merge_plugin_into_settings(
+    settings: dict, plugin_root: Path, python_exe: str
+) -> dict:
     """Add kos-memory plugin block + MCP server. Idempotent."""
     plugin_root_str = str(plugin_root.resolve()).replace("\\", "/")
 
@@ -105,14 +107,66 @@ def merge_plugin_into_settings(settings: dict, plugin_root: Path) -> dict:
         "version": "4.0.0",
     }
 
-    # Block 2: mcpServers (so MCP server is registered globally too)
+    # Block 2: mcpServers (so MCP server is registered globally too).
+    # Use the absolute path of the Python that ran the installer — avoids
+    # PATH ambiguity (Mac/Linux often have only python3, not python).
     mcp = settings.setdefault("mcpServers", {})
     mcp["kos-memory"] = {
-        "command": "python",
+        "command": python_exe,
         "args": [str(plugin_root / "mcp" / "server.py").replace("\\", "/")],
     }
 
     return settings
+
+
+def patch_plugin_manifest(plugin_root: Path, python_exe: str,
+                          dry_run: bool = False) -> tuple[bool, str]:
+    """Rewrite hook + mcpServer command strings in plugin.json to use the
+    detected Python interpreter. Without this, Claude Code's hook runner
+    invokes `python` which may not exist on Mac/Linux (only `python3`).
+
+    Idempotent — safe to re-run."""
+    manifest_path = plugin_root / ".claude-plugin" / "plugin.json"
+    if not manifest_path.exists():
+        return False, f"manifest missing at {manifest_path}"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"manifest unreadable: {e}"
+
+    # Quote the python path for shells (Windows paths often have spaces)
+    needs_quoting = " " in python_exe and not (
+        python_exe.startswith('"') and python_exe.endswith('"')
+    )
+    py_token = f'"{python_exe}"' if needs_quoting else python_exe
+
+    changed = False
+    # Patch hook commands: "python <path>" → "<py_exe> <path>"
+    for hook_name, entries in (manifest.get("hooks") or {}).items():
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                cmd = h.get("command", "")
+                if cmd.startswith("python "):
+                    h["command"] = py_token + cmd[len("python"):]
+                    changed = True
+
+    # Patch mcpServers
+    mcp = manifest.get("mcpServers") or {}
+    server = mcp.get("kos-memory")
+    if server and server.get("command") == "python":
+        server["command"] = python_exe
+        changed = True
+
+    if not changed:
+        return True, "manifest already patched (no changes)"
+    if dry_run:
+        return True, f"DRY-RUN: would patch manifest with python={python_exe!r}"
+
+    # Atomic write
+    tmp = manifest_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    tmp.replace(manifest_path)
+    return True, f"patched manifest with python={python_exe!r}"
 
 
 def write_settings(path: Path, settings: dict) -> None:
@@ -188,19 +242,28 @@ def main() -> int:
                         help=f"Path to Claude settings.json (default: {SETTINGS_DEFAULT})")
     parser.add_argument("--skip-smoke", action="store_true",
                         help="Skip the post-install smoke test.")
+    parser.add_argument("--python", default=None,
+                        help="Override Python interpreter to use for hooks "
+                             "and MCP server (default: the one running this "
+                             "script, i.e. sys.executable).")
     args = parser.parse_args()
+
+    python_exe = args.python or sys.executable
+    # Normalize to forward slashes on Windows for portability in JSON
+    python_exe = python_exe.replace("\\", "/")
 
     print("=" * 60)
     print("kos-memory v4 installer")
     print("=" * 60)
     print(f"Plugin root: {PLUGIN_ROOT}")
+    print(f"Python:      {python_exe}")
     print(f"Settings:    {args.user_settings}")
     print(f"Mode:        {'DRY-RUN' if args.dry_run else 'INSTALL'}")
     print()
 
     # Step 1: Python version
     ok, msg = check_python()
-    print(f"[1/5] Python check: {msg}")
+    print(f"[1/6] Python check: {msg}")
     if not ok:
         print("  ABORT: incompatible Python.")
         return 1
@@ -208,21 +271,29 @@ def main() -> int:
     # Step 2: Plugin file integrity
     ok, missing = check_files()
     if not ok:
-        print(f"[2/5] File check: MISSING {len(missing)} files:")
+        print(f"[2/6] File check: MISSING {len(missing)} files:")
         for m in missing:
             print(f"      - {m}")
         return 1
-    print(f"[2/5] File check: all required files present")
+    print(f"[2/6] File check: all required files present")
 
-    # Step 3: Load settings
+    # Step 3: Patch plugin.json with detected Python interpreter
+    ok, msg = patch_plugin_manifest(PLUGIN_ROOT, python_exe,
+                                    dry_run=args.dry_run)
+    print(f"[3/6] Manifest patch: {msg}")
+    if not ok:
+        print("  ABORT: cannot patch manifest.")
+        return 1
+
+    # Step 4: Load settings
     settings_path = Path(args.user_settings).expanduser()
     settings = load_settings(settings_path)
-    print(f"[3/5] Loaded settings ({len(settings)} top-level keys)")
+    print(f"[4/6] Loaded settings ({len(settings)} top-level keys)")
 
-    # Step 4: Merge
-    settings = merge_plugin_into_settings(settings, PLUGIN_ROOT)
+    # Step 5: Merge into settings
+    settings = merge_plugin_into_settings(settings, PLUGIN_ROOT, python_exe)
     if args.dry_run:
-        print(f"[4/5] DRY-RUN: would write the following blocks to settings:")
+        print(f"[5/6] DRY-RUN: would write the following blocks to settings:")
         preview = {
             "enabledPlugins": settings.get("enabledPlugins", {}),
             "mcpServers": {"kos-memory": settings.get("mcpServers", {}).get("kos-memory")},
@@ -230,14 +301,14 @@ def main() -> int:
         print(json.dumps(preview, indent=2))
     else:
         write_settings(settings_path, settings)
-        print(f"[4/5] Wrote settings to {settings_path}")
+        print(f"[5/6] Wrote settings to {settings_path}")
 
-    # Step 5: Smoke test
+    # Step 6: Smoke test
     if args.skip_smoke or args.dry_run:
-        print(f"[5/5] Smoke test: SKIPPED")
+        print(f"[6/6] Smoke test: SKIPPED")
     else:
         ok, msg = smoke_test()
-        print(f"[5/5] Smoke test: {msg}")
+        print(f"[6/6] Smoke test: {msg}")
         if not ok:
             print("  WARNING: install completed but smoke test failed. Investigate.")
             return 2
@@ -246,6 +317,14 @@ def main() -> int:
     print("=" * 60)
     print("Done. Restart Claude Code, then try:  /memory-status")
     print("=" * 60)
+    # Friendly nag for contributors: don't accidentally commit the per-user
+    # python path baked into plugin.json
+    if not args.dry_run and (PLUGIN_ROOT / ".git").exists():
+        print()
+        print("Note for contributors: this install mutated "
+              ".claude-plugin/plugin.json")
+        print("with your local Python path. If you plan to commit, run:")
+        print("  git restore .claude-plugin/plugin.json")
     return 0
 
 

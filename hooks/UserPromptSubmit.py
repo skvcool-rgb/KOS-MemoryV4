@@ -30,7 +30,7 @@ except Exception:
     pass
 
 
-# Patterns indicating user wants past context
+# Recall triggers — user is asking about the past
 TRIGGER_PATTERNS = [
     r"\b(check|look at|recall|find|remember)\b.*\b(past|last|previous|earlier)\b",
     r"\bwhat did (we|i) (discuss|decide|do|build|ship|fix)\b",
@@ -42,7 +42,20 @@ TRIGGER_PATTERNS = [
     r"\b/recall|\b/recover|\b/check[- ]history\b",
 ]
 
+# Build-status triggers — user wants the CURRENT state of something. v5.0
+# auto-runs the reality_sync verdict so Claude doesn't have to invoke a tool.
+# Patterns deliberately require a status-vocab anchor word so they don't
+# overlap with past-tense recall triggers like "where did we leave off".
+BUILD_STATUS_PATTERNS = [
+    r"\bis\s+(\w[\w\s\-]{1,40}?)\s+(built|done|shipped|ready|working|live|deployed|complete|in\s+production|in\s+main|merged|pushed|tagged)\b",
+    r"\b(did|have)\s+(we|i|you)\s+(build|built|ship|shipped|finish|finished|complete|completed|implement|implemented|deploy|deployed|release|released)\s+(\w[\w\s\-]{1,40})",
+    r"\bwhat'?s?\s+(the\s+)?(status|state)\s+of\s+(\w[\w\s\-]{1,40})",
+    r"\bcurrent\s+(state|status)\s+(of|on)\s+(\w[\w\s\-]{1,40})",
+    r"\bwhere\s+(does|stands?)\s+(\w[\w\s\-]{1,40})",
+]
+
 COMPILED = [re.compile(p, re.IGNORECASE) for p in TRIGGER_PATTERNS]
+COMPILED_BUILD = [re.compile(p, re.IGNORECASE) for p in BUILD_STATUS_PATTERNS]
 
 
 # Bounds for primary-mode auto-recall output
@@ -70,6 +83,30 @@ def _detect_trigger(prompt: str) -> str | None:
         m = pat.search(prompt)
         if m:
             return m.group(0)
+    return None
+
+
+def _detect_build_status_trigger(prompt: str) -> tuple[str, str] | None:
+    """If the prompt asks about CURRENT build state, return (matched, topic).
+    The topic is the noun-phrase the user is asking about."""
+    if not prompt or prompt.lstrip().startswith("/"):
+        return None
+    for pat in COMPILED_BUILD:
+        m = pat.search(prompt)
+        if m:
+            # Pull the most likely topic group — last non-stopword group
+            groups = [g for g in m.groups() if g and len(g) > 1]
+            stop = {"the", "we", "i", "you", "did", "have", "has", "of", "on",
+                    "in", "is", "are", "production", "main", "merged",
+                    "pushed", "tagged", "complete", "completed", "done",
+                    "built", "shipped", "ready", "working", "live", "deployed",
+                    "implement", "implemented", "create", "created", "finish",
+                    "finished", "build", "ship", "deploy", "state", "status"}
+            for g in reversed(groups):
+                tokens = [t for t in g.split() if t.lower() not in stop]
+                if tokens:
+                    return m.group(0), " ".join(tokens).strip()
+            return m.group(0), m.group(0)
     return None
 
 
@@ -211,13 +248,63 @@ def _run_primary_auto_recall(prompt: str, project: str, matched: str) -> None:
         pass
 
 
+def _run_build_status_check(prompt: str, project: str,
+                             matched: str, topic: str) -> None:
+    """v5.0: when user asks about current build state, run reality_sync
+    inline so Claude has a verdict + evidence before answering."""
+    try:
+        from lib.codebase_survey import survey_project
+        from lib.paths import FILE_CHUNKS_DB, ensure_kos_dir
+        from lib.reality_sync import quick_status_for_topic, render_status_verdict
+        from lib.store import Store
+    except Exception:
+        return
+
+    try:
+        kos_dir = ensure_kos_dir(project, user_level=False)
+    except Exception:
+        return
+
+    db = kos_dir / FILE_CHUNKS_DB
+    chunks: list = []
+    if db.exists():
+        try:
+            store = Store(db)
+            try:
+                # Pull last 60 days for status checks (broader than recall)
+                cutoff = int(time.time()) - 60 * 86400
+                chunks = [
+                    {
+                        "text": r["text"], "ts": r["ts"],
+                        "session_id": r["session_id"],
+                        "asserted_by_user": bool(r["asserted_by_user"]),
+                    }
+                    for r in store.iter_chunks(since_ts=cutoff)
+                ][:1000]
+            finally:
+                store.close()
+        except Exception:
+            pass
+
+    try:
+        survey = survey_project(project)
+    except Exception:
+        return
+
+    verdict = quick_status_for_topic(topic, chunks, survey)
+    print(
+        f"[kos-memory PRIMARY] Build-status check fired on \"{matched[:60]}\"\n"
+        f"\n{render_status_verdict(verdict)}\n"
+        f"\nUse this verdict and the SessionStart Live state + "
+        f"Reconciliation sections to answer the user. If chunks claim a "
+        f"thing was built but filesystem/git disagree (above), surface "
+        f"the contradiction — DO NOT assert 'not built' without checking."
+    )
+
+
 def main() -> int:
     prompt, project = _read_payload()
     if not prompt:
-        return 0
-
-    matched = _detect_trigger(prompt)
-    if not matched:
         return 0
 
     # Resolve mode (defaults to primary in v4.1+)
@@ -226,6 +313,21 @@ def main() -> int:
         mode = get_mode(project)
     except Exception:
         mode = "primary"
+
+    # Past-tense recall triggers FIRST — they take priority when both match
+    # (e.g. "where did we leave off" should not be treated as build-status)
+    matched = _detect_trigger(prompt)
+
+    # v5.0: build-status triggers run reality-sync inline (primary mode only)
+    if matched is None and mode != "backup":
+        bs = _detect_build_status_trigger(prompt)
+        if bs is not None:
+            matched_bs, topic = bs
+            _run_build_status_check(prompt, project, matched_bs, topic)
+            return 0
+
+    if matched is None:
+        return 0
 
     if mode == "backup":
         _emit_backup_hint(matched)

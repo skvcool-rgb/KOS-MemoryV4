@@ -224,6 +224,115 @@ class UserPromptSubmitPrimaryModeTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
 
 
+class UserPromptSubmitBuildStatusTests(unittest.TestCase):
+    """v5.0: build-status questions auto-trigger reality_sync verdict."""
+
+    def _primary_env(self):
+        return {"KOS_MEMORY_MODE": "primary"}
+
+    def test_is_X_built_fires_build_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.dumps({"prompt": "is the auth module built",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0, msg=r.stderr)
+            self.assertIn("Build-status check fired", r.stdout)
+            self.assertIn("[reality check]", r.stdout)
+
+    def test_did_we_ship_fires_build_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.dumps({"prompt": "did we ship the new dashboard",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("Build-status check fired", r.stdout)
+
+    def test_status_of_X_fires_build_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.dumps({"prompt": "what's the status of payment integration",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("Build-status check fired", r.stdout)
+
+    def test_past_tense_recall_takes_priority(self):
+        # "where did we leave off" must NOT trigger build-status
+        # (it's a past-tense recall trigger)
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.dumps({"prompt": "where did we leave off",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            # No store + no MEMORY.md = silent (recall path)
+            self.assertEqual(r.stdout.strip(), "")
+
+    def test_build_status_silent_in_backup_mode(self):
+        # In backup mode, build-status triggers don't fire — consistency
+        # with v4.0 behavior
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.dumps({"prompt": "is the auth module built",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={"KOS_MEMORY_MODE": "backup",
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertNotIn("Build-status check", r.stdout)
+
+
+class SessionStartV5ReconciliationTests(unittest.TestCase):
+    """v5.0: SessionStart in primary mode includes Live state +
+    Reconciliation sections."""
+
+    def test_emits_live_state_when_git_repo(self):
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as tmp:
+            # Init a git repo
+            sp.run(["git", "init", "-b", "main"], cwd=tmp,
+                   capture_output=True, check=True)
+            sp.run(["git", "config", "user.email", "t@t"], cwd=tmp,
+                   capture_output=True)
+            sp.run(["git", "config", "user.name", "t"], cwd=tmp,
+                   capture_output=True)
+            (Path(tmp) / "f.py").write_text("# f", encoding="utf-8")
+            sp.run(["git", "add", "."], cwd=tmp, capture_output=True)
+            sp.run(["git", "commit", "-m", "init"], cwd=tmp,
+                   capture_output=True, check=True)
+
+            _seed_chunk(tmp)
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides={"KOS_MEMORY_MODE": "primary",
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0, msg=r.stderr)
+            self.assertIn("[kos-memory PRIMARY]", r.stdout)
+            self.assertIn("Live project state", r.stdout)
+            self.assertIn("branch:", r.stdout)
+            self.assertIn("Build-status reconciliation", r.stdout)
+
+    def test_authority_order_block_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _seed_chunk(tmp)
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides={"KOS_MEMORY_MODE": "primary",
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("Authority order", r.stdout)
+            self.assertIn("filesystem + git", r.stdout)
+            self.assertIn("BEFORE claiming", r.stdout)
+
+
 class StopHookTests(unittest.TestCase):
     def _make_transcript(self, dir_path: Path, lines: list[dict]) -> Path:
         p = dir_path / "transcript.jsonl"

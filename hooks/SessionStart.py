@@ -54,12 +54,14 @@ try:
     )
     from lib.paths import FILE_CATALOG
     from lib.store import Store
+    from lib.codebase_survey import render_live_state, survey_project
+    from lib.reality_sync import reconcile, render_reconciliation
 except Exception:
     sys.exit(0)
 
 
-# Output token-cost guards
-MAX_OUTPUT_CHARS = 8000
+# Output token-cost guards (raised in v5.0 for Live state + Reconciliation)
+MAX_OUTPUT_CHARS = 16000
 
 
 def _format_age(latest_ts: int | None) -> str:
@@ -88,6 +90,8 @@ def _emit_primary_block(
     catalog_text: str,
     memory_block: str,
     drift_warnings: list[str],
+    live_state: str,
+    reconciliation: str,
 ) -> str:
     parts: list[str] = [
         f"[kos-memory PRIMARY] Memory reconstruction "
@@ -101,9 +105,19 @@ def _emit_primary_block(
         parts.append(memory_block)
         parts.append("")
 
+    if live_state:
+        parts.append("## Live project state (filesystem + git, surveyed now)")
+        parts.append(live_state)
+        parts.append("")
+
     if catalog_text:
         parts.append("## Recent session catalog (auto-extracted)")
         parts.append(catalog_text)
+        parts.append("")
+
+    if reconciliation:
+        parts.append("## Build-status reconciliation (chunks vs filesystem)")
+        parts.append(reconciliation)
         parts.append("")
 
     if drift_warnings:
@@ -111,15 +125,16 @@ def _emit_primary_block(
         for w in drift_warnings:
             parts.append(f"- ⚠ {w}")
         parts.append("")
-    else:
-        parts.append("## Drift")
-        parts.append("- (no drift detected — MEMORY.md aligns with chunks)")
-        parts.append("")
 
     parts.append(
-        "Use /recall <query> for deep recovery on any topic above. "
-        "Treat MEMORY.md anchors as authoritative; auto-extracted chunks "
-        "are higher-recall but may be stale."
+        "Authority order for any claim about project state:\n"
+        "  1. Live project state (filesystem + git) — ground truth\n"
+        "  2. MEMORY.md anchors — operator-curated truth\n"
+        "  3. User-asserted chunks (/remember) — explicit pins\n"
+        "  4. Auto-extracted chunks — high-recall, may be stale\n"
+        "BEFORE claiming anything is 'not built', check the Live state "
+        "and Reconciliation sections above. If reconciliation flags drift, "
+        "surface it instead of asserting. Use /recall for deep retrieval."
     )
     out = "\n".join(parts)
     if len(out) > MAX_OUTPUT_CHARS:
@@ -172,14 +187,25 @@ def main() -> int:
         return 0
 
     # ── Primary mode: full reconstruction block ───────────
-    # Stage 1: build & render catalog
+    # Stage 1: build & render catalog + read all chunks for reconciliation
     catalog_text = ""
+    chunks_for_reconcile: list = []
     try:
         store = Store(db)
         try:
             catalog = build_catalog(store, project=project)
             save_catalog(kos_dir / FILE_CATALOG, catalog)
             catalog_text = render_catalog_for_claude(catalog)
+            # Pull last 30 days of chunks for reality-sync (bounded)
+            cutoff = int(time.time()) - 30 * 86400
+            chunks_for_reconcile = [
+                {
+                    "text": r["text"], "ts": r["ts"],
+                    "session_id": r["session_id"],
+                    "asserted_by_user": bool(r["asserted_by_user"]),
+                }
+                for r in store.iter_chunks(since_ts=cutoff)
+            ][:500]  # cap for performance
         finally:
             store.close()
     except Exception:
@@ -189,6 +215,24 @@ def main() -> int:
     memory_files = find_memory_files(project)
     parsed_memory = [parse_memory_file(mf) for mf in memory_files]
     memory_block = render_memory_block(parsed_memory, heading_only=True)
+
+    # Live filesystem + git state (NEW v5.0)
+    live_state = ""
+    survey = None
+    try:
+        survey = survey_project(project)
+        live_state = render_live_state(survey)
+    except Exception:
+        live_state = ""
+
+    # Reconciliation (NEW v5.0)
+    reconciliation = ""
+    if survey and chunks_for_reconcile:
+        try:
+            rep = reconcile(chunks_for_reconcile, survey, parsed_memory)
+            reconciliation = render_reconciliation(rep)
+        except Exception:
+            reconciliation = ""
 
     # Drift detection: compare MEMORY.md mtime vs latest chunk ts
     chunks_since_memory_update = 0
@@ -213,6 +257,8 @@ def main() -> int:
         catalog_text=catalog_text,
         memory_block=memory_block,
         drift_warnings=drift_warnings,
+        live_state=live_state,
+        reconciliation=reconciliation,
     ))
     return 0
 

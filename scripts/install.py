@@ -104,7 +104,7 @@ def merge_plugin_into_settings(
     enabled = settings.setdefault("enabledPlugins", {})
     enabled["kos-memory"] = {
         "path": plugin_root_str,
-        "version": "4.1.0",
+        "version": "5.0.0",
     }
 
     # Block 2: mcpServers (so MCP server is registered globally too).

@@ -1,35 +1,77 @@
-# kos-memory v4
+# kos-memory v5
 
-**Per-project primary memory for Claude Code. MEMORY.md as truth-anchor, auto-recall on triggers, zero dependencies.**
+**Per-project primary memory + reality-sync for Claude Code. Native experience — no slash commands to learn, no files to feed manually. Claude knows what's built before it answers.**
 
-[![Tests](https://img.shields.io/badge/tests-229%2F229-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-268%2F268-brightgreen)](#testing)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
 [![Dependencies](https://img.shields.io/badge/deps-zero-brightgreen)](#requirements)
 [![Mode](https://img.shields.io/badge/default-primary-blueviolet)](#modes)
 
-When you start a Claude Code session, kos-memory automatically injects this:
+## The v5 promise
+
+Stop feeding Claude your folders, MEMORY.md, or "here's what we built last week" preambles. The plugin does it for you, every session, automatically.
+
+When you start a session, kos-memory auto-injects:
 
 ```
 [kos-memory PRIMARY] Memory reconstruction (1,247 chunks, 52 sessions, last ingest: today)
 
 ## MEMORY.md anchors (operator-curated truth)
 ### project_memory_md (MEMORY.md, 14m ago, 256892 bytes)
-  # 🌐 LANGUAGE MIGRATION ROADMAP
   # 🚨 RESUME-HERE POINTER
-  # ⚠️ FEEDBACK NOTES
+  # 🌐 LANGUAGE MIGRATION ROADMAP
   ...
 
+## Live project state (filesystem + git, surveyed now)
+  branch:        main (clean)
+  head:          4ae35ec "v5.0.0 release"
+  vs upstream:   origin/main (0 ahead, 0 behind)
+  tags:          v5.0.0, v4.1.0, v4.0.0, v0.7.26-RC1, v0.7.25-RC4
+  last commits:
+    4ae35ec  v5.0.0 — primary memory + reality-sync
+    ede9b47  fix(installer): bake sys.executable into manifest
+    dafd412  docs: point repo URLs to KOS-MemoryV4
+  versions:
+    .claude-plugin/plugin.json: 5.0.0
+    lib/__init__.py: 5.0.0
+  tree:          .claude-plugin/, lib/ (12 .py), hooks/ (4 .py),
+                 mcp/ (3 .py), commands/ (6 .md), tests/ (14 .py)
+
 ## Recent session catalog (auto-extracted)
-- 2026-05-03 · a3f2b1c0 [auth, refactor] → fix oauth flow ...
-- 2026-05-02 · 9e1d8c44 [bugfix] → race condition in cache ...
+- 2026-05-03 · 4ae35ec [primary, memory-md] → v4.1.0 release ...
+- 2026-05-03 · ede9b47 [installer] → fix Mac/Linux PATH ...
 - (3 more)
 
+## Build-status reconciliation (chunks vs filesystem)
+  ✓ confirmed (chunks + filesystem agree): lib/store.py, hooks/Stop.py,
+    mcp/server.py, README.md, install.py, ... +6
+  (no reconciliation signal — chunks aligned with filesystem)
+
 ## Drift
-- (no drift detected — MEMORY.md aligns with chunks)
+- (no drift; MEMORY.md aligns with chunks)
+
+Authority order for any claim about project state:
+  1. Live project state (filesystem + git) — ground truth
+  2. MEMORY.md anchors — operator-curated truth
+  3. User-asserted chunks (/remember) — explicit pins
+  4. Auto-extracted chunks — high-recall, may be stale
+BEFORE claiming anything is 'not built', check the Live state and
+Reconciliation sections above.
 ```
 
-When you ask "where did we leave off", kos-memory auto-runs Stage 0+1+2 of the recall pipeline and emits the actual passages inline — no waiting for Claude to invoke a tool.
+When you ask **"is X built"** or **"what's the status of Y"** or **"did we ship Z"**, the UserPromptSubmit hook auto-runs a reality-sync verdict before Claude's turn:
+
+```
+[kos-memory PRIMARY] Build-status check fired on "is the auth module built"
+
+[reality check] 'auth module' is BUILT — confirmed by 12 chunks,
+filesystem evidence, and git (commit abc123 "fix oauth flow").
+  evidence: chunks=claimed_built, filesystem=confirms,
+            git=committed (confidence: high)
+```
+
+So Claude no longer says "I don't see X — probably not built" when X *is* built. The verdict is right there in the prompt.
 
 ## Install (60 seconds)
 
@@ -51,20 +93,31 @@ Re-run `python scripts/install.py` any time — it's idempotent.
 
 **Uninstall:** delete the `kos-memory` entries from `~/.claude/settings.json`. Per-project data lives in each project's `.kos-memory/` directory (delete to wipe).
 
-## What it does
+## What it does (full automation, native to Claude Code)
 
 **Capture** (silent, automatic):
 - `Stop` hook — ingests transcript at end of every session.
 - `PreCompact` hook (auto only, never manual `/compact`) — saves state before auto-compaction.
 
-**Inject** (primary mode default — what makes it "primary"):
-- `SessionStart` hook — emits **memory reconstruction**: rendered Stage-1 catalog of recent sessions + MEMORY.md heading skeleton + drift warnings. Bounded at ~2 KB.
-- `UserPromptSubmit` hook on trigger phrases ("where we left off", "as we discussed", etc.) — auto-runs Stage 0+1+2 and emits top passages **inline** (no tool round-trip).
+**Inject** at session start (primary mode default):
+- `SessionStart` hook — emits the full reconstruction block above. Auto-includes:
+  - **MEMORY.md anchors** found across 5 standard locations (project root, `.claude/`, Claude Code's auto-memory at `~/.claude/projects/<encoded>/memory/MEMORY.md`, user-global `CLAUDE.md`)
+  - **Live project state** — git branch, head, tags, last 5 commits, dirty files, package versions, top-level tree (cached 60s)
+  - **Recent session catalog** — top sessions in last 30 days
+  - **Build-status reconciliation** — cross-references chunks claims vs filesystem; flags `claimed_but_missing`, `built_but_undocumented`, `version_skew`
+  - **Drift warnings** — when MEMORY.md is stale relative to latest chunks
+  - **Authority order** — explicit instruction to Claude about which source wins when claims conflict
+  - All bounded at ~16 KB.
 
-**Recall** (explicit, on demand):
+**Inject** on user prompt (primary mode triggers):
+- Past-tense triggers ("where did we leave off") → auto-runs Stage 0+1+2 of recall, emits passages inline.
+- Present-tense build-status triggers ("is X built", "what's the status of Y", "did we ship Z") → auto-runs reality-sync verdict and emits it inline before Claude's turn.
+
+**Manual recall** (rarely needed in v5 — primary mode auto-injects):
 - `/recall <query>` — full 4-stage pipeline with synthesis prompt.
-- `recall_project_memory` MCP tool — Claude self-invokes when it senses missing context (5/session, 50/day, $0.50/day caps).
-- `/remember <fact>` — pin a user-asserted chunk (weighted higher in recall ranking).
+- `recall_project_memory` MCP tool — Claude self-invokes when needed (5/session, 50/day, $0.50/day caps).
+- `/remember <fact>` — pin a user-asserted chunk.
+- `/memory-mode primary|backup` — toggle modes (default = primary; backup = v4.0 legacy).
 
 **Indexing** (local SQLite, zero processes between sessions):
 - `.kos-memory/chunks.db` per project (or `~/.config/kos-memory/user/` for cross-project pins).
@@ -105,10 +158,10 @@ Or set `KOS_MEMORY_MODE=backup` in your shell env (highest priority — override
 ## Testing
 
 ```bash
-python -m unittest discover tests    # 229 tests, ~30 seconds
+python -m unittest discover tests    # 268 tests, ~40 seconds
 ```
 
-Tests cover: store schema migration, chunker boundary cases (incl. 1MB inputs and unicode), BM25 epsilon-floor for tiny corpora, BOM-encoded settings.json, schema-mismatch refusal, hook subprocess invocation in both modes, MCP JSON-RPC handshake + throttling, MEMORY.md detection across all 5 search locations, drift detection thresholds, mode resolution priority, fresh-clone install end-to-end, real-document ingest+recall on a 19 KB .docx (69 chunks → 16 ms recall).
+Tests cover: store schema migration, chunker boundary cases (incl. 1MB inputs and unicode), BM25 epsilon-floor for tiny corpora, BOM-encoded settings.json, schema-mismatch refusal, hook subprocess invocation in both modes, MCP JSON-RPC handshake + throttling, MEMORY.md detection across all 5 search locations, drift detection thresholds, mode resolution priority, fresh-clone install end-to-end, real-document ingest+recall on a 19 KB .docx (69 chunks → 16 ms recall), **codebase survey on real git repos (git state, tree, package versions)**, **reality_sync reconciliation with confirmed/missing/skew classification**, **build-status verdict generation (high/medium/low confidence with evidence breakdown)**, **trigger ordering (past-tense recall vs present-tense build-status)**, and **session-start v5 output integration (Live state + Reconciliation + Authority order block)**.
 
 ## Quick use
 

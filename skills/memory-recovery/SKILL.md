@@ -1,117 +1,99 @@
 ---
 name: memory-recovery
-description: Decide when and how to use kos-memory backup recall. Use this skill when the user references prior context, asks about past decisions, or the current chat feels like it's missing history that another session would have had.
+description: kos-memory v5 — primary memory + reality-sync. Use this skill on every project-state or past-context question. Read the SessionStart preamble FIRST (it already has live filesystem state + chunks reconciliation + MEMORY.md anchors) before claiming anything is or isn't built.
 ---
 
-# memory-recovery — when to use the kos-memory backup
+# memory-recovery — primary memory contract (v5.0+)
 
-This skill teaches you when (and just as importantly, when *not*) to invoke `recall_project_memory` and the `/recall` slash command.
+This skill replaces the v4.0 "decide when to recall" judgment with a **hard contract** so the user never has to feed you context manually.
 
-## Mental model
+## The contract (READ FIRST)
 
-kos-memory is a **backup**, not a primary context source. The current chat already has:
-- The user's message
-- Files in the workspace (read them with `Read`)
-- The conversation so far
+**v5.0 changes everything.** The SessionStart hook already injects, automatically:
 
-kos-memory adds:
-- Snippets from prior sessions on this project
-- User-pinned facts (`/remember` → `asserted_by_user=true`)
-- Auto-extracted summaries from Stop and PreCompact hooks
+1. **MEMORY.md anchors** — operator-curated truth (highest authority).
+2. **Live project state** — git branch, head SHA, last 5 commits, tags, dirty files, package versions, top-level tree, test status. All from a fresh subprocess survey.
+3. **Recent session catalog** — top sessions in last 30 days with tags + summaries.
+4. **Build-status reconciliation** — auto-cross-references chunks claims vs filesystem. Flags `claimed_but_missing` (chunks say built, files don't show it), `built_but_undocumented`, `version_skew`.
+5. **Drift warnings** — if MEMORY.md is stale vs latest chunks.
 
-You should only reach for the backup when the current sources are **insufficient**.
+You see all of this BEFORE the user's first prompt arrives. **Reading it is non-negotiable**.
 
-## When to invoke
+When the user asks "what's the status of X" or "did we ship Y", the UserPromptSubmit hook also auto-runs `reality_sync.quick_status_for_topic(X)` and prints a verdict line BEFORE your turn:
 
-**STRONG signals — invoke without hesitation:**
-
-1. The user says one of:
-   - "what did we decide about X"
-   - "where did we leave off"
-   - "as we discussed earlier"
-   - "remember the thing we built last week"
-   - "/recall ..." (explicit slash command)
-
-2. SessionStart hook printed `[kos-memory BACKUP]` and the user references something the current chat doesn't cover.
-
-3. UserPromptSubmit hook printed `[kos-memory hint]` with a matched pattern AND the current context can't answer the question.
-
-4. The user mentions a file/decision/feature you've never seen in this session AND the project clearly has more history (the SessionStart line said "N chunks, M sessions").
-
-**WEAK signals — pause and think first:**
-
-- The user asks an open-ended question that *could* benefit from history but doesn't reference it.
-- You're stuck on a problem and want to know if a past session solved it.
-
-For weak signals, prefer `Read` on workspace files first. Only fall back to `recall_project_memory` if the workspace doesn't have the answer.
-
-**DO NOT invoke when:**
-
-- The user just opened a file and is asking what it does — read the file.
-- The current message is self-contained (e.g. "write a sort function").
-- The throttle is exhausted (5/session, 50/day, $0.50/day) — tell the user, don't keep trying.
-- The store is empty (`SessionStart` printed nothing) — there's nothing to recall yet.
-- The query would just summarize the current chat — wait for the Stop hook.
-
-## How to invoke
-
-### Path A — explicit `/recall` (user-driven)
-
-The user types `/recall <query>`. The slash command runs Stage 0+1 via the CLI helper, hands you the catalog, you pick sessions, then Stage 2 + Stage 3 synthesis. Follow the steps in `commands/recall.md`.
-
-### Path B — implicit `recall_project_memory` MCP tool (you-driven)
-
-You decide a recall is needed mid-conversation. Call the tool:
-
-```json
-{
-  "name": "recall_project_memory",
-  "arguments": {
-    "query": "auth refactor decisions",
-    "window_days": 30,
-    "user": false
-  }
-}
+```
+[reality check] 'X' is BUILT — confirmed by 12 chunks, filesystem evidence, and git (commit abc123).
+  evidence: chunks=claimed_built, filesystem=confirms, git=committed (confidence: high)
 ```
 
-The tool returns:
-- A catalog block (Stage 1)
-- Selected passages (Stage 2 — already filtered)
-- Synthesis instructions
+## Authority order for any project-state claim
 
-You then produce sections (a)–(e) in your reply. **Always** cite source dates (`[2026-04-15]`).
+1. **Live project state** (git + filesystem) — ground truth, present-tense
+2. **MEMORY.md anchors** — operator-curated truth, persistent
+3. **User-asserted chunks** (`/remember`) — explicit pins, recent
+4. **Auto-extracted chunks** — high-recall, may be stale
+5. **Your prior beliefs from training data** — least authoritative for THIS project
 
-## Synthesis rules (Stage 3)
+When sources conflict, the lower-numbered one wins.
 
-- DO NOT reproduce raw passage text. Synthesize.
-- Use **exactly** these sections:
-  - **(a) NEW ITEMS** — bullets, with source date
-  - **(b) POTENTIALLY STALE** — what current context believes that past content updated
-  - **(c) SUGGESTED UPDATED STATE** — concise integrated paragraph
-  - **(d) UNCERTAINTY** — what's ambiguous; ask the user
-  - **(e) CONTRADICTIONS DETECTED** — `superseded_chunk_ids: [...]` (empty if none)
-- Conflict resolution: prefer the most recent unless explicitly contradicted by even-newer.
-- User-asserted (`asserted_by_user=true`) outweighs auto-extracted, all else equal.
-- If section (e) is non-empty, the slash command will writeback via `mark_contradicted`. The MCP tool path doesn't auto-writeback — mention this to the user and they can run `/recall` to commit.
+## Hard rules (must follow)
 
-## Throttle awareness
+**Rule 1 — Never claim "not built" without evidence.**
+> If a user asks whether X is built/shipped/done, and the SessionStart preamble or `[reality check]` line shows ANY positive signal (chunks mention, file exists, git commit, tag), do not respond with "X is not built". Instead either:
+>   (a) Affirm the build with the evidence you have, or
+>   (b) Say "I see signals X was built (cite source) but verify with you — is the current state still what those signals describe?"
 
-| Path | Cap |
-|---|---|
-| `recall_project_memory` MCP tool | 5/session, 50/day, $0.50/day |
-| `/recall` slash command | 50/day, $0.50/day (no per-session cap) |
-| `remember_fact` MCP tool | none (cheap, write-only) |
-| `/remember` slash command | none |
+**Rule 2 — Reconciliation flags are mandatory disclosures.**
+> If `## Build-status reconciliation` lists "claimed but missing" or "version skew" entries that match the user's question, surface them in your reply. Don't paper over them.
 
-If a recall is throttled, tell the user the limit and suggest `/recall` (which has the higher cap).
+**Rule 3 — Live state beats memory.**
+> If chunks say "v4.0 shipped" but Live state shows `tags: v5.1.0` and head commit subject mentions v5.1, the live state wins. Memory is for context, not authority on current state.
 
-## Hook signals you'll see
+**Rule 4 — Don't ask for files the preamble already has.**
+> Before requesting that the user paste or read a file, check whether the preamble already shows it (MEMORY.md anchors, tree, last commits). The whole point of v5 is the user shouldn't have to manually feed context.
 
-- `[kos-memory BACKUP] N chunks, M sessions for this project (last ingest: today). Use /recall when current context is missing past detail.` → from SessionStart, treat as background info.
-- `[kos-memory hint] User prompt matched recall pattern ("..."). Consider calling the recall_project_memory MCP tool if you sense missing context.` → from UserPromptSubmit, this is a *suggestion* not an order. Decide based on whether you actually need history.
+## When to use `/recall` or `recall_project_memory` MCP tool
+
+After v5.0, manual recall is rarely needed because primary mode auto-injects. Reach for it only when:
+
+- The auto-injected catalog mentions a session_id but its content was elided (truncation marker)
+- The user's question is about a topic with **zero** signal in the preamble (chunks=silent, filesystem=silent, git=silent) — recall might surface deeper history
+- You need to dig into a specific session's full context — use `/recall` with session-id-shaped query
+
+If the SessionStart preamble already answers the question, do NOT call recall — that's wasted budget.
+
+## Throttle awareness (unchanged)
+
+`recall_project_memory` MCP: 5/session, 50/day, $0.50/day. The auto-injected SessionStart preamble does NOT count against throttle.
+
+## Hook signals you'll see (v5.0)
+
+- `[kos-memory PRIMARY] Memory reconstruction (...)` — SessionStart preamble. Always read it.
+- `[kos-memory PRIMARY] Auto-recall fired on trigger (...)` — UserPromptSubmit on past-tense triggers. Passages already inline.
+- `[kos-memory PRIMARY] Build-status check fired on (...)` — UserPromptSubmit on present-tense status questions. Verdict already inline.
+- `[kos-memory BACKUP] ...` / `[kos-memory hint] ...` — only in opt-out backup mode (legacy v4.0 behavior).
+
+## When manual `/recall` IS still useful
+
+After v5.0, manual recall is rarely needed because primary mode auto-injects. Use it only when:
+
+- The catalog mentions a session_id but its content was elided (truncation marker shown).
+- You need to dump a SPECIFIC session's full chunks for deep review.
+- The user explicitly types `/recall <query>` themselves.
+
+The `/recall` synthesis sections (a)–(e) below still apply when invoked:
+
+**(a) NEW ITEMS** — bullets with source date
+**(b) POTENTIALLY STALE** — what current context believes that past content updated
+**(c) SUGGESTED UPDATED STATE** — concise integrated paragraph
+**(d) UNCERTAINTY** — what's ambiguous; ask the user
+**(e) CONTRADICTIONS DETECTED** — `superseded_chunk_ids: [...]` (empty if none)
+
+Conflict resolution: prefer the most recent unless explicitly contradicted by even-newer. User-asserted outweighs auto-extracted.
 
 ## What this skill does NOT cover
 
-- How to seed the store. That happens automatically via Stop and PreCompact hooks. Users can also run `/remember <fact>`.
-- How to migrate stores between machines. See `commands/memory-export.md` and `commands/memory-import.md`.
-- Cross-project recall. Add `--user` (slash command) or `user: true` (MCP tool).
+- How to seed the store. That happens automatically via Stop and PreCompact hooks.
+- How to fix actual drift. Operator updates MEMORY.md or runs `/remember`.
+- Cross-project recall (`--user` flag). Same as v4.0.
+- Cross-machine sync. See `commands/memory-export.md` and `commands/memory-import.md`.

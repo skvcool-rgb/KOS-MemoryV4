@@ -225,6 +225,6 @@ Backup files (`settings.json.bak-*`) are preserved by the installer and may need
 
 ## Support
 
-- Repo: https://github.com/skvcool-rgb/KOS-Memory
+- Repo: https://github.com/skvcool-rgb/KOS-MemoryV4
 - Architecture rationale: see `README.md` and the v3 → v4 migration section.
 - Build-time decisions: see `HANDOVER.md`.

@@ -4,7 +4,7 @@
   "description": "Per-project, hybrid-retrieval memory backup layer for Claude Code. Pure-stdlib, zero dependencies. Backup mode — never primary.",
   "author": "skvcool-rgb",
   "license": "MIT",
-  "homepage": "https://github.com/skvcool-rgb/KOS-Memory",
+  "homepage": "https://github.com/skvcool-rgb/KOS-MemoryV4",
   "hooks": {
     "SessionStart": [
       {"hooks": [{"type": "command", "command": "python ${CLAUDE_PLUGIN_ROOT}/hooks/SessionStart.py", "timeout": 3}]}

@@ -38,7 +38,6 @@ Path: `C:\Users\suraj\Downloads\kos-memory-v4\`
 
 ### What's NOT in v4 (deferred)
 - Rust port (v5) — gates on adoption signal
-- GitHub repo update — currently has v3 OSS at https://github.com/skvcool-rgb/KOS-Memory
 - Marketplace listing — manual install only for now
 - /memory-prune subcommand — exporters can do this manually
 - Cross-machine sync — exporters/importers are the manual path
@@ -53,9 +52,7 @@ Path: `C:\Users\suraj\Downloads\kos-memory-v4\`
 
 ### GitHub repo
 
-`https://github.com/skvcool-rgb/KOS-Memory`
-
-**Important:** this repo currently contains the v3 OSS release. v4 has NOT been pushed yet. Do NOT push v4 to `main` until the build is complete and tests pass. Recommended branch when ready: `v4-rewrite` or tag `v4.0.0-rc1`.
+`https://github.com/skvcool-rgb/KOS-MemoryV4` — dedicated v4 repo (v3 lives separately at `KOS-Memory`).
 
 ### Files already created (full inventory with line counts)
 
@@ -443,7 +440,7 @@ When all sprints are green, push to GitHub on a `v4-rewrite` branch (NOT main), 
 ## 8. Quick-reference
 
 **Project path:** `C:\Users\suraj\Downloads\kos-memory-v4\`
-**GitHub:** `https://github.com/skvcool-rgb/KOS-Memory` (currently v3 — do NOT push v4 here yet)
+**GitHub:** `https://github.com/skvcool-rgb/KOS-MemoryV4`
 **Test corpus:** `C:\Users\suraj\Downloads\self_improving_ai_fields.docx`
 **User memory dir (Windows):** `%APPDATA%/kos-memory/user/`
 **Plugin install dir (eventual):** `~/.claude/plugins/kos-memory/`

@@ -35,33 +35,95 @@ def _run_hook(hook_name: str, *, env_overrides: dict | None = None,
     )
 
 
-class SessionStartHookTests(unittest.TestCase):
+def _seed_chunk(project_dir: str) -> None:
+    """Helper: create a minimal chunks.db so SessionStart has something to print."""
+    from lib.paths import FILE_CHUNKS_DB, ensure_kos_dir
+    from lib.store import Store
+    kos = ensure_kos_dir(project_dir, user_level=False)
+    s = Store(kos / FILE_CHUNKS_DB)
+    s.add_chunk(text="seed chunk for hook test",
+                session_id="hooktest", ts=int(time.time()))
+    s.upsert_session("hooktest", started_at=int(time.time()),
+                     chunk_count=1, summary="seed", tags=["seed"])
+    s.close()
+
+
+class SessionStartBackupModeTests(unittest.TestCase):
+    """v4.0 legacy behavior — explicit KOS_MEMORY_MODE=backup."""
+
+    def _backup_env(self):
+        return {"KOS_MEMORY_MODE": "backup"}
+
     def test_silent_when_no_db(self):
         with tempfile.TemporaryDirectory() as tmp:
-            r = _run_hook("SessionStart", project_dir=tmp)
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides=self._backup_env())
             self.assertEqual(r.returncode, 0)
             self.assertEqual(r.stdout.strip(), "")
 
     def test_prints_marker_when_db_has_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
-            from lib.paths import FILE_CHUNKS_DB, ensure_kos_dir
-            from lib.store import Store
-            kos = ensure_kos_dir(tmp, user_level=False)
-            s = Store(kos / FILE_CHUNKS_DB)
-            s.add_chunk(text="hello", session_id="x", ts=int(time.time()))
-            s.upsert_session("x", started_at=int(time.time()), chunk_count=1)
-            s.close()
-
-            r = _run_hook("SessionStart", project_dir=tmp)
+            _seed_chunk(tmp)
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides=self._backup_env())
             self.assertEqual(r.returncode, 0)
             self.assertIn("[kos-memory BACKUP]", r.stdout)
             self.assertIn("chunks", r.stdout)
 
 
-class UserPromptSubmitHookTests(unittest.TestCase):
+class SessionStartPrimaryModeTests(unittest.TestCase):
+    """v4.1 default behavior — KOS_MEMORY_MODE=primary."""
+
+    def _primary_env(self):
+        return {"KOS_MEMORY_MODE": "primary"}
+
+    def test_silent_when_no_db_and_no_memory_md(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Isolate user home so the user-global CLAUDE.md doesn't leak in
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout.strip(), "")
+
+    def test_emits_primary_block_with_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _seed_chunk(tmp)
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0, msg=r.stderr)
+            self.assertIn("[kos-memory PRIMARY]", r.stdout)
+            # Catalog section must appear
+            self.assertIn("session catalog", r.stdout.lower())
+            # Drift section must appear (even if empty)
+            self.assertIn("Drift", r.stdout)
+
+    def test_emits_memory_md_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _seed_chunk(tmp)
+            (Path(tmp) / "MEMORY.md").write_text(
+                "# Project notes\n\n## Decisions\n\n- chose Postgres\n",
+                encoding="utf-8",
+            )
+            r = _run_hook("SessionStart", project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("[kos-memory PRIMARY]", r.stdout)
+            self.assertIn("MEMORY.md", r.stdout)
+            # Heading skeleton appears (heading_only=True at SessionStart)
+            self.assertIn("Project notes", r.stdout)
+
+
+class UserPromptSubmitBackupModeTests(unittest.TestCase):
+    def _backup_env(self):
+        return {"KOS_MEMORY_MODE": "backup"}
+
     def test_silent_when_no_trigger(self):
         payload = json.dumps({"prompt": "write a sort function"})
-        r = _run_hook("UserPromptSubmit", stdin_data=payload)
+        r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                      env_overrides=self._backup_env())
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), "")
 
@@ -75,7 +137,8 @@ class UserPromptSubmitHookTests(unittest.TestCase):
         ]
         for trigger in triggers:
             payload = json.dumps({"prompt": trigger})
-            r = _run_hook("UserPromptSubmit", stdin_data=payload)
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          env_overrides=self._backup_env())
             self.assertEqual(r.returncode, 0, msg=f"trigger={trigger!r}")
             self.assertIn(
                 "[kos-memory hint]", r.stdout,
@@ -85,7 +148,65 @@ class UserPromptSubmitHookTests(unittest.TestCase):
     def test_skips_slash_command(self):
         # Slash commands have their own handler; hook should not duplicate
         payload = json.dumps({"prompt": "/recall what did we discuss"})
-        r = _run_hook("UserPromptSubmit", stdin_data=payload)
+        r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                      env_overrides=self._backup_env())
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+
+class UserPromptSubmitPrimaryModeTests(unittest.TestCase):
+    """In primary mode, triggers cause inline auto-recall."""
+
+    def _primary_env(self):
+        return {"KOS_MEMORY_MODE": "primary"}
+
+    def test_silent_when_no_trigger(self):
+        payload = json.dumps({"prompt": "write a sort function"})
+        r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                      env_overrides=self._primary_env())
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_silent_when_no_data_and_no_memory_md(self):
+        # Primary mode shouldn't generate noise when there's nothing to recall
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = json.dumps({"prompt": "where did we leave off",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout.strip(), "")
+
+    def test_auto_recalls_inline_with_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from lib.paths import FILE_CHUNKS_DB, ensure_kos_dir
+            from lib.store import Store
+            kos = ensure_kos_dir(tmp, user_level=False)
+            s = Store(kos / FILE_CHUNKS_DB)
+            s.add_chunk(text="we chose Postgres for the user table",
+                        session_id="recent", ts=int(time.time()))
+            s.upsert_session("recent", started_at=int(time.time()),
+                             chunk_count=1, summary="db decision",
+                             tags=["db"])
+            s.close()
+
+            payload = json.dumps({"prompt": "what did we decide about postgres",
+                                  "cwd": tmp})
+            r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                          project_dir=tmp,
+                          env_overrides={**self._primary_env(),
+                                         "HOME": tmp, "USERPROFILE": tmp})
+            self.assertEqual(r.returncode, 0, msg=r.stderr)
+            self.assertIn("[kos-memory PRIMARY] Auto-recall", r.stdout)
+            # The actual passage text leaked through
+            self.assertIn("Postgres", r.stdout)
+
+    def test_skips_slash_command(self):
+        payload = json.dumps({"prompt": "/recall postgres"})
+        r = _run_hook("UserPromptSubmit", stdin_data=payload,
+                      env_overrides=self._primary_env())
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), "")
 

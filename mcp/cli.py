@@ -404,6 +404,60 @@ def cmd_rebuild_catalog(args) -> int:
     return 0
 
 
+def cmd_memory_mode(args) -> int:
+    """Inspect or set the active kos-memory mode."""
+    from lib.paths import (
+        FILE_CONFIG,
+        VALID_MODES,
+        get_mode,
+        set_mode,
+    )
+
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    if args.mode:
+        if args.mode not in VALID_MODES:
+            return _err(f"invalid mode {args.mode!r}, must be one of {VALID_MODES}")
+        cfg = set_mode(args.mode, project_root=project,
+                       user_level=bool(args.user))
+        _emit({
+            "ok": True,
+            "mode": args.mode,
+            "scope": "user" if args.user else "project",
+            "config_path": str(cfg),
+        })
+        return 0
+
+    # Inspect both scopes
+    proj_mode = get_mode(project_root=project)
+    # User-level resolution: bypass project config to reveal user scope only
+    import os as _os
+    saved = _os.environ.pop("KOS_MEMORY_MODE", None)
+    try:
+        from lib.paths import ensure_kos_dir
+        user_kos = ensure_kos_dir(None, user_level=True)
+        user_cfg = user_kos / FILE_CONFIG
+        user_mode = None
+        if user_cfg.exists():
+            try:
+                import json as _json
+                user_mode = _json.loads(user_cfg.read_text(encoding="utf-8")).get("mode")
+            except Exception:
+                user_mode = None
+    finally:
+        if saved is not None:
+            _os.environ["KOS_MEMORY_MODE"] = saved
+
+    _emit({
+        "ok": True,
+        "active_mode": proj_mode,
+        "project_mode": proj_mode,
+        "user_mode": user_mode,
+        "env_override": _os.environ.get("KOS_MEMORY_MODE"),
+        "valid_modes": list(VALID_MODES),
+    })
+    return 0
+
+
 def cmd_mark_contradicted(args) -> int:
     """Flag chunks as superseded by later session."""
     kos_dir = _resolve_kos_dir(args)
@@ -472,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     prc = sub.add_parser("rebuild_catalog", help="Force catalog refresh")
     prc.add_argument("--user", action="store_true")
     prc.set_defaults(func=cmd_rebuild_catalog)
+
+    pmode = sub.add_parser("memory_mode", help="Inspect or set primary/backup mode")
+    pmode.add_argument("--mode", choices=("primary", "backup"), default=None)
+    pmode.add_argument("--user", action="store_true")
+    pmode.set_defaults(func=cmd_memory_mode)
 
     pm = sub.add_parser("mark_contradicted", help="Flag chunks superseded")
     pm.add_argument("--kos-dir", default=None)

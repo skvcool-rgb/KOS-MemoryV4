@@ -1,17 +1,35 @@
 # kos-memory v4
 
-**Per-project, hybrid-retrieval memory backup for Claude Code. Pure-stdlib, zero dependencies. Backup mode — never primary.**
+**Per-project primary memory for Claude Code. MEMORY.md as truth-anchor, auto-recall on triggers, zero dependencies.**
 
-[![Tests](https://img.shields.io/badge/tests-164%2F164-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-229%2F229-brightgreen)](#testing)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
 [![Dependencies](https://img.shields.io/badge/deps-zero-brightgreen)](#requirements)
+[![Mode](https://img.shields.io/badge/default-primary-blueviolet)](#modes)
+
+When you start a Claude Code session, kos-memory automatically injects this:
 
 ```
-[kos-memory BACKUP] 1,247 chunks, 52 sessions for this project
-                    (last ingest: today). Use /recall when current
-                    context is missing past detail.
+[kos-memory PRIMARY] Memory reconstruction (1,247 chunks, 52 sessions, last ingest: today)
+
+## MEMORY.md anchors (operator-curated truth)
+### project_memory_md (MEMORY.md, 14m ago, 256892 bytes)
+  # 🌐 LANGUAGE MIGRATION ROADMAP
+  # 🚨 RESUME-HERE POINTER
+  # ⚠️ FEEDBACK NOTES
+  ...
+
+## Recent session catalog (auto-extracted)
+- 2026-05-03 · a3f2b1c0 [auth, refactor] → fix oauth flow ...
+- 2026-05-02 · 9e1d8c44 [bugfix] → race condition in cache ...
+- (3 more)
+
+## Drift
+- (no drift detected — MEMORY.md aligns with chunks)
 ```
+
+When you ask "where did we leave off", kos-memory auto-runs Stage 0+1+2 of the recall pipeline and emits the actual passages inline — no waiting for Claude to invoke a tool.
 
 ## Install (60 seconds)
 
@@ -35,25 +53,62 @@ Re-run `python scripts/install.py` any time — it's idempotent.
 
 ## What it does
 
-- **Captures** session transcripts at end-of-session (`Stop` hook) and before auto-compact (`PreCompact` hook).
-- **Indexes** them locally in SQLite (`.kos-memory/chunks.db`) — no daemon, no server, no ML.
-- **Surfaces** them on demand via:
-  - `/recall <query>` — explicit user-driven recovery
-  - `recall_project_memory` MCP tool — Claude self-invokes when it senses missing context
-  - `[kos-memory hint]` line on natural-language triggers like "where did we leave off"
+**Capture** (silent, automatic):
+- `Stop` hook — ingests transcript at end of every session.
+- `PreCompact` hook (auto only, never manual `/compact`) — saves state before auto-compaction.
 
-## What it does NOT do
+**Inject** (primary mode default — what makes it "primary"):
+- `SessionStart` hook — emits **memory reconstruction**: rendered Stage-1 catalog of recent sessions + MEMORY.md heading skeleton + drift warnings. Bounded at ~2 KB.
+- `UserPromptSubmit` hook on trigger phrases ("where we left off", "as we discussed", etc.) — auto-runs Stage 0+1+2 and emits top passages **inline** (no tool round-trip).
 
-- It does **not** inject memory into every prompt. It's a backup, not primary context.
-- It does **not** run a background daemon. v3 daemon lost data and was killed; v4 has zero processes between sessions.
-- It does **not** use ML or embeddings. BM25 + grep + a tiny synonym cache.
-- It does **not** auto-recall. You or Claude has to explicitly request it.
+**Recall** (explicit, on demand):
+- `/recall <query>` — full 4-stage pipeline with synthesis prompt.
+- `recall_project_memory` MCP tool — Claude self-invokes when it senses missing context (5/session, 50/day, $0.50/day caps).
+- `/remember <fact>` — pin a user-asserted chunk (weighted higher in recall ranking).
+
+**Indexing** (local SQLite, zero processes between sessions):
+- `.kos-memory/chunks.db` per project (or `~/.config/kos-memory/user/` for cross-project pins).
+- BM25 + tiny synonym cache + per-chunk `asserted_by_user` and `contradicted_by_later_session` flags.
+
+## MEMORY.md as truth-anchor
+
+kos-memory treats `MEMORY.md` (and `CLAUDE.md`) as **operator-curated authoritative truth**. The reconstruction layer cross-references it on every session start:
+
+**Search order** (first match wins for each kind):
+1. `<project>/MEMORY.md`
+2. `<project>/.claude/MEMORY.md`
+3. `<project>/CLAUDE.md`
+4. `~/.claude/projects/<encoded>/memory/MEMORY.md` ← Claude Code auto-memory
+5. `~/.claude/CLAUDE.md` ← user-global
+
+**Drift detection:** if MEMORY.md is 12+ hours older than the most recent chunk AND ≥5 chunks have been ingested since, you'll see a warning at session start. If MEMORY.md is missing entirely while the store has data, you get a friendly nudge to create one.
+
+**Conflict resolution:** during recall synthesis, MEMORY.md anchors win over auto-extracted chunks. User-asserted chunks (`/remember`) win over auto-extracted. Most-recent wins among auto-extracted unless explicitly contradicted.
+
+## Modes
+
+| Mode | SessionStart | UserPromptSubmit (trigger) | Default? |
+|---|---|---|---|
+| **primary** | Catalog + MEMORY.md + drift inline | Auto-runs Stage 0+1+2 inline | ✓ v4.1+ |
+| **backup** | 1-line marker only | 1-line hint only | v4.0 legacy |
+
+Switch modes:
+
+```bash
+/memory-mode backup        # for this project
+/memory-mode primary       # back to default
+/memory-mode --user backup # for the user-level cross-project store
+```
+
+Or set `KOS_MEMORY_MODE=backup` in your shell env (highest priority — overrides config files).
 
 ## Testing
 
 ```bash
-python -m unittest discover tests    # 164 tests, ~13 seconds
+python -m unittest discover tests    # 229 tests, ~30 seconds
 ```
+
+Tests cover: store schema migration, chunker boundary cases (incl. 1MB inputs and unicode), BM25 epsilon-floor for tiny corpora, BOM-encoded settings.json, schema-mismatch refusal, hook subprocess invocation in both modes, MCP JSON-RPC handshake + throttling, MEMORY.md detection across all 5 search locations, drift detection thresholds, mode resolution priority, fresh-clone install end-to-end, real-document ingest+recall on a 19 KB .docx (69 chunks → 16 ms recall).
 
 ## Quick use
 

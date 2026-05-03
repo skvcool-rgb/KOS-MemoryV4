@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-"""UserPromptSubmit hook — detect natural-language recall triggers.
+"""UserPromptSubmit hook — mode-aware natural-language recall trigger.
 
-Pure regex. Sub-2ms. NO LLM. NO state mutations.
+Pure regex match. <100 ms in backup mode, <500 ms in primary mode (which
+runs Stage 0+1+2 of the recall pipeline inline so passages reach Claude
+without waiting for it to invoke the recall_project_memory MCP tool).
 
-If the user's message matches a recall trigger pattern, prints a
-single-line marker telling Claude that the user is implicitly asking
-for memory recall. Claude then decides whether to invoke the
-recall_project_memory MCP tool.
+Backup mode  → emit a 1-line hint, let Claude decide (legacy v4.0).
+Primary mode → auto-run Stage 0+1+2, emit catalog+top-5-passages inline.
 
-Trigger discipline: max 1 implicit recall per session (Claude itself
-should decide when to actually call the tool — this hook just signals).
+Trigger discipline (both modes): max 1 trigger per turn. Slash commands
+go through commands/, not via this hook.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +28,7 @@ try:
     force_utf8_io()
 except Exception:
     pass
+
 
 # Patterns indicating user wants past context
 TRIGGER_PATTERNS = [
@@ -43,36 +45,193 @@ TRIGGER_PATTERNS = [
 COMPILED = [re.compile(p, re.IGNORECASE) for p in TRIGGER_PATTERNS]
 
 
-def main() -> int:
+# Bounds for primary-mode auto-recall output
+MAX_PASSAGES_INLINE = 5
+MAX_OUTPUT_CHARS = 6000
+
+
+def _read_payload() -> tuple[str, str]:
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
     except Exception:
-        sys.exit(0)
-
+        return "", ""
     prompt = payload.get("prompt") or payload.get("user_prompt") or ""
-    if not isinstance(prompt, str) or not prompt:
-        sys.exit(0)
+    if not isinstance(prompt, str):
+        return "", ""
+    project = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    return prompt, project
 
-    matched = None
+
+def _detect_trigger(prompt: str) -> str | None:
+    if not prompt or prompt.lstrip().startswith("/"):
+        return None
     for pat in COMPILED:
         m = pat.search(prompt)
         if m:
-            matched = m.group(0)
-            break
+            return m.group(0)
+    return None
 
-    if not matched:
-        sys.exit(0)
 
-    # Detect explicit slash commands separately — they go through commands/, not via this hook
-    if prompt.lstrip().startswith("/"):
-        sys.exit(0)
-
+def _emit_backup_hint(matched: str) -> None:
     print(
         f"[kos-memory hint] User prompt matched recall pattern "
         f"(\"{matched[:60]}\"). Consider calling the "
         f"recall_project_memory MCP tool if you sense missing context."
     )
+
+
+def _run_primary_auto_recall(prompt: str, project: str, matched: str) -> None:
+    """In primary mode, run Stage 0+1+2 inline and emit passages directly."""
+    try:
+        from lib.budget import Budget
+        from lib.memory_md import (
+            find_memory_files,
+            parse_memory_file,
+            render_memory_block,
+        )
+        from lib.paths import FILE_BUDGET, FILE_CHUNKS_DB, ensure_kos_dir
+        from lib.recall import (
+            RecallContext,
+            stage_0_local_expansion,
+            stage_1_catalog,
+            stage_2_grep,
+        )
+    except Exception:
+        # Imports failed — degrade to hint behavior
+        _emit_backup_hint(matched)
+        return
+
+    try:
+        kos_dir = ensure_kos_dir(project, user_level=False)
+    except Exception:
+        _emit_backup_hint(matched)
+        return
+
+    db = kos_dir / FILE_CHUNKS_DB
+    memory_files = find_memory_files(project)
+    if not db.exists() and not memory_files:
+        # Nothing to recall — stay silent (no false positives)
+        return
+
+    # Budget gate (lightweight — auto-recall is cheap so we set a small
+    # estimate; daily caps still protect against runaway).
+    try:
+        budget = Budget(kos_dir / FILE_BUDGET)
+        allowed, reason = budget.can_recall(estimated_tokens=600)
+        if not allowed:
+            print(
+                f"[kos-memory PRIMARY] auto-recall throttled: {reason}. "
+                f"Use /recall manually if needed."
+            )
+            return
+    except Exception:
+        pass
+
+    # Use the trigger phrase as the query if user gave nothing more specific
+    query = prompt.strip()
+    if len(query) > 200:
+        query = matched
+
+    rc = RecallContext(
+        query=query,
+        window_days=30,
+        project_root=project,
+        user_level=False,
+    )
+
+    parts: list[str] = [
+        f"[kos-memory PRIMARY] Auto-recall fired on trigger "
+        f"(\"{matched[:60]}\")",
+        "",
+    ]
+
+    # Stage 0+1+2 if there's a chunks DB
+    n_passages = 0
+    if db.exists():
+        try:
+            stage_0_local_expansion(rc, kos_dir)
+            stage_1_catalog(rc, kos_dir)
+            stage_2_grep(rc, kos_dir)
+            n_passages = len(rc.passages)
+        except Exception:
+            n_passages = 0
+
+        if rc.catalog_text:
+            parts.append("## Catalog (top recent sessions)")
+            # Compress catalog to stay within budget
+            cat = rc.catalog_text
+            if len(cat) > 1500:
+                cat = cat[:1500] + "\n... [catalog truncated]"
+            parts.append(cat)
+            parts.append("")
+
+        if rc.passages:
+            parts.append(f"## Top passages (showing {min(n_passages, MAX_PASSAGES_INLINE)} of {n_passages})")
+            for p in rc.passages[:MAX_PASSAGES_INLINE]:
+                date = time.strftime("%Y-%m-%d", time.gmtime(p["ts"]))
+                tags: list[str] = []
+                if p.get("asserted_by_user"):
+                    tags.append("user-asserted")
+                if p.get("contradicted_by_later_session"):
+                    tags.append("SUPERSEDED")
+                tag_str = (" [" + ", ".join(tags) + "]") if tags else ""
+                sid = (p.get("session_id") or "")[:8]
+                text = p["text"]
+                if len(text) > 600:
+                    text = text[:600] + "..."
+                parts.append(f"\n[{sid}, {date}{tag_str}]\n{text}")
+            parts.append("")
+
+    # MEMORY.md anchors (always include if present — the truth-anchor)
+    if memory_files:
+        parsed = [parse_memory_file(mf) for mf in memory_files]
+        block = render_memory_block(parsed, heading_only=True)
+        if block:
+            parts.append("## MEMORY.md anchors (truth)")
+            parts.append(block)
+            parts.append("")
+
+    parts.append(
+        "Synthesize against current context. Prefer MEMORY.md anchors as "
+        "authoritative; auto-extracted chunks are higher-recall but may "
+        "be stale. Cite source dates."
+    )
+
+    out = "\n".join(parts)
+    if len(out) > MAX_OUTPUT_CHARS:
+        out = out[:MAX_OUTPUT_CHARS] + "\n... [truncated for context budget]"
+
+    print(out)
+
+    # Record budget spend (rough estimate: ~tokens = chars/4)
+    try:
+        budget.record_recall(tokens=len(out) // 4 + 100, cost_usd=0.0)
+    except Exception:
+        pass
+
+
+def main() -> int:
+    prompt, project = _read_payload()
+    if not prompt:
+        return 0
+
+    matched = _detect_trigger(prompt)
+    if not matched:
+        return 0
+
+    # Resolve mode (defaults to primary in v4.1+)
+    try:
+        from lib.paths import MODE_BACKUP, MODE_PRIMARY, get_mode
+        mode = get_mode(project)
+    except Exception:
+        mode = "primary"
+
+    if mode == "backup":
+        _emit_backup_hint(matched)
+    else:
+        _run_primary_auto_recall(prompt, project, matched)
+
     return 0
 
 

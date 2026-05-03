@@ -39,6 +39,40 @@ def _survey(tree=None, tags=None, commits=None, versions=None):
     )
 
 
+class VersionRegexTests(unittest.TestCase):
+    """v6.0.1: regex must distinguish version tags from IP addresses.
+
+    Real-world bug found during dogfood: '127.0.0.1' was being matched
+    as version '0.0.1', flagging false version-skew for the HTTP server's
+    bind address."""
+
+    def test_v_prefixed_versions_match(self):
+        from lib.reality_sync import EVIDENCE_TAG_RE
+        self.assertEqual(EVIDENCE_TAG_RE.findall("v1.2.3"), ["v1.2.3"])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("v0.7.26-RC1"), ["v0.7.26-RC1"])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("v6.0.0"), ["v6.0.0"])
+
+    def test_bare_versions_match(self):
+        from lib.reality_sync import EVIDENCE_TAG_RE
+        self.assertEqual(EVIDENCE_TAG_RE.findall("shipped 5.0.0 yesterday"),
+                         ["5.0.0"])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("release 6.0.1"), ["6.0.1"])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("1.2.3-RC1"), ["1.2.3-RC1"])
+
+    def test_ip_addresses_do_not_match(self):
+        from lib.reality_sync import EVIDENCE_TAG_RE
+        self.assertEqual(EVIDENCE_TAG_RE.findall("127.0.0.1"), [])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("192.168.1.1"), [])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("10.0.0.1"), [])
+        self.assertEqual(EVIDENCE_TAG_RE.findall("listening on 127.0.0.1:7621"), [])
+
+    def test_mixed_text_extracts_only_versions(self):
+        from lib.reality_sync import EVIDENCE_TAG_RE
+        text = "host 10.0.0.1 then ship 1.0.0 — also v6.0.1"
+        self.assertEqual(set(EVIDENCE_TAG_RE.findall(text)),
+                         {"1.0.0", "v6.0.1"})
+
+
 class ReconcileTests(unittest.TestCase):
     def test_empty_returns_empty_report(self):
         rep = reconcile([], _survey())

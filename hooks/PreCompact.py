@@ -165,4 +165,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        from lib.safety import run_safely
+        sys.exit(run_safely(main, hook_name="PreCompact", timeout_s=7.0))
+    except Exception:
+        sys.exit(0)

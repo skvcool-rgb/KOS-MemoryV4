@@ -25,7 +25,25 @@ EVIDENCE_FILE_RE = re.compile(
     r"\b([A-Za-z0-9_\-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|rb|php|c|cpp|h|hpp|sql|"
     r"toml|yaml|yml|json|md|sh))\b"
 )
-EVIDENCE_TAG_RE = re.compile(r"\bv?\d+\.\d+\.\d+(?:-\w+)?\b")
+# Version-tag regex. v6.0.1: tightened to avoid IP-address false positives.
+# Negative lookbehind blocks matches preceded by `digit.` (which would mean
+# we're in the middle of a longer dotted run — i.e. an IP address). Negative
+# lookahead blocks matches followed by `.digit` (same reason).
+# Three valid shapes:
+#   1. "v" prefix + N.N.N(-suffix)?       — e.g. v1.2.3, v0.7.26-RC1
+#   2. Bare N.N.N + REQUIRED -suffix      — e.g. 1.2.3-RC1 (suffix disambiguates)
+#   3. Bare N.N.N standalone              — e.g. shipped 5.0.0 yesterday
+#                                            (rejected when adjacent digit-dots
+#                                             present, like in 127.0.0.1)
+EVIDENCE_TAG_RE = re.compile(
+    r"(?<![.\d])"                              # not preceded by digit-or-dot
+    r"(?:"
+    r"v\d+\.\d+\.\d+(?:-[A-Za-z][\w.-]*)?"     # vX.Y.Z(-RC1)?
+    r"|"
+    r"\d+\.\d+\.\d+(?:-[A-Za-z][\w.-]*)?"      # X.Y.Z(-RC1)?
+    r")"
+    r"(?!\.?\d)"                               # not followed by another dotted digit
+)
 EVIDENCE_COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 

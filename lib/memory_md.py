@@ -201,8 +201,14 @@ def detect_drift(
     parsed: list[ParsedMemory],
     latest_chunk_ts: int | None,
     chunks_since_memory_update: int,
+    bootstrap_chunks_since_memory_update: int = 0,
 ) -> list[str]:
     """Return a list of drift warnings (each a one-line string).
+
+    v6.0.1: bootstrap_chunks_since_memory_update is the count of chunks
+    tagged kind=bootstrap_doc or kind=bootstrap_transcript. When 95%+ of
+    "newer than MEMORY.md" chunks are bootstrap, drift is suppressed —
+    bootstrap is seeding history, not signaling that MEMORY.md is stale.
 
     Drift signals:
       - MEMORY.md older than the most recent ingested chunk by 12+ hours
@@ -228,11 +234,23 @@ def detect_drift(
 
     delta = latest_chunk_ts - newest_memory_ts
     if delta > 12 * 3600 and chunks_since_memory_update >= 5:
+        # v6.0.1: suppress drift when ≥95% of "newer" chunks are bootstrap.
+        # Bootstrap chunks are seeded historical content (README/transcripts),
+        # not real signal that MEMORY.md is stale.
+        non_bootstrap = (
+            chunks_since_memory_update - bootstrap_chunks_since_memory_update
+        )
+        bootstrap_ratio = (
+            bootstrap_chunks_since_memory_update / chunks_since_memory_update
+            if chunks_since_memory_update else 0.0
+        )
+        if bootstrap_ratio >= 0.95:
+            return warnings
         hrs = delta // 3600
         warnings.append(
             f"MEMORY.md is {hrs}h older than latest ingested chunk; "
-            f"{chunks_since_memory_update} chunks ingested since last MEMORY.md "
-            f"update — anchor may be stale."
+            f"{non_bootstrap} non-bootstrap chunks ingested since last "
+            f"MEMORY.md update — anchor may be stale."
         )
     return warnings
 

@@ -2,7 +2,7 @@
 
 Local-first memory + reality-sync for any LLM coding tool. Auto-injects MEMORY.md, git state, and session history at session start. Bootstraps from existing project docs and Claude Code transcripts. Multi-machine sync, marker-fenced MEMORY.md auto-curation, opt-in test-runner integration. HTTP + MCP + CLI surfaces for Claude Code, Claude Desktop, Cursor, Cline, Zed, Aider, Continue.dev, and shell scripts. Pure-stdlib, zero dependencies.
 
-[![Tests](https://img.shields.io/badge/tests-374%2F374-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-399%2F399-brightgreen)](#testing)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#install-60-seconds)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
 [![Dependencies](https://img.shields.io/badge/deps-zero-brightgreen)](#install-60-seconds)

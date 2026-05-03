@@ -251,8 +251,11 @@ def main() -> int:
         except Exception:
             reconciliation = ""
 
-    # Drift detection: compare MEMORY.md mtime vs latest chunk ts
+    # Drift detection: compare MEMORY.md mtime vs latest chunk ts.
+    # v6.0.1: also count bootstrap chunks separately so detect_drift can
+    # suppress false drift right after /memory-bootstrap.
     chunks_since_memory_update = 0
+    bootstrap_chunks_since_memory_update = 0
     if parsed_memory:
         newest_mem_ts = max(pm.file.mtime for pm in parsed_memory)
         try:
@@ -260,11 +263,16 @@ def main() -> int:
             chunks_since_memory_update = c.execute(
                 "SELECT COUNT(*) FROM chunks WHERE ts > ?", (newest_mem_ts,)
             ).fetchone()[0]
+            bootstrap_chunks_since_memory_update = c.execute(
+                "SELECT COUNT(*) FROM chunks WHERE ts > ? "
+                "AND kind LIKE 'bootstrap%'", (newest_mem_ts,),
+            ).fetchone()[0]
             c.close()
         except Exception:
             pass
     drift_warnings = detect_drift(
         parsed_memory, latest_ts, chunks_since_memory_update,
+        bootstrap_chunks_since_memory_update,
     )
 
     print(_emit_primary_block(
@@ -281,4 +289,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        from lib.safety import run_safely
+        sys.exit(run_safely(main, hook_name="SessionStart", timeout_s=8.0))
+    except Exception:
+        # Defensive: even safety setup failed. Last resort: silent exit.
+        sys.exit(0)

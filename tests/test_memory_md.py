@@ -248,6 +248,42 @@ class DetectDriftTests(unittest.TestCase):
         self.assertEqual(len(warns), 1)
         self.assertIn("stale", warns[0])
 
+    def test_drift_suppressed_when_all_chunks_are_bootstrap(self):
+        """v6.0.1: bootstrap chunks shouldn't trigger drift."""
+        now = int(time.time())
+        pm = self._mkparsed(now - 25 * 3600)  # MEMORY.md 25h old
+        # 100% of newer chunks are bootstrap → drift suppressed
+        warns = detect_drift(
+            [pm], latest_chunk_ts=now,
+            chunks_since_memory_update=210,
+            bootstrap_chunks_since_memory_update=210,
+        )
+        self.assertEqual(warns, [])
+
+    def test_drift_suppressed_when_95pct_chunks_are_bootstrap(self):
+        now = int(time.time())
+        pm = self._mkparsed(now - 25 * 3600)
+        # 95% bootstrap (210 of 220) → suppressed
+        warns = detect_drift(
+            [pm], latest_chunk_ts=now,
+            chunks_since_memory_update=220,
+            bootstrap_chunks_since_memory_update=210,
+        )
+        self.assertEqual(warns, [])
+
+    def test_drift_fires_when_under_95pct_bootstrap(self):
+        now = int(time.time())
+        pm = self._mkparsed(now - 25 * 3600)
+        # 50% bootstrap (50 of 100) → drift still fires for the 50 real chunks
+        warns = detect_drift(
+            [pm], latest_chunk_ts=now,
+            chunks_since_memory_update=100,
+            bootstrap_chunks_since_memory_update=50,
+        )
+        self.assertEqual(len(warns), 1)
+        # The warning should report the non-bootstrap count, not total
+        self.assertIn("50 non-bootstrap chunks", warns[0])
+
     def test_stale_memory_md_with_few_chunks_silent(self):
         # Threshold: 5+ chunks AND 12+ hours
         now = int(time.time())

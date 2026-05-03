@@ -104,7 +104,7 @@ def merge_plugin_into_settings(
     enabled = settings.setdefault("enabledPlugins", {})
     enabled["kos-memory"] = {
         "path": plugin_root_str,
-        "version": "6.0.0",
+        "version": "6.0.1",
     }
 
     # Block 2: mcpServers (so MCP server is registered globally too).
@@ -140,20 +140,30 @@ def patch_plugin_manifest(plugin_root: Path, python_exe: str,
     )
     py_token = f'"{python_exe}"' if needs_quoting else python_exe
 
+    # v6.0.1: idempotent — replace WHATEVER interpreter token is currently
+    # in the command (could be "python", an absolute path, a quoted path,
+    # or a different python from a previous install). Split on the
+    # template marker "${CLAUDE_PLUGIN_ROOT}" since it's stable.
+    PLUGIN_MARKER = "${CLAUDE_PLUGIN_ROOT}"
     changed = False
-    # Patch hook commands: "python <path>" → "<py_exe> <path>"
     for hook_name, entries in (manifest.get("hooks") or {}).items():
         for entry in entries:
             for h in entry.get("hooks", []):
                 cmd = h.get("command", "")
-                if cmd.startswith("python "):
-                    h["command"] = py_token + cmd[len("python"):]
+                if PLUGIN_MARKER not in cmd:
+                    continue
+                # Everything before the marker is the interpreter prefix
+                idx = cmd.index(PLUGIN_MARKER)
+                tail = cmd[idx:]
+                desired = f"{py_token} {tail}"
+                if cmd != desired:
+                    h["command"] = desired
                     changed = True
 
-    # Patch mcpServers
+    # Patch mcpServers — replace any interpreter token (not just literal "python")
     mcp = manifest.get("mcpServers") or {}
     server = mcp.get("kos-memory")
-    if server and server.get("command") == "python":
+    if server and "command" in server and server["command"] != python_exe:
         server["command"] = python_exe
         changed = True
 
